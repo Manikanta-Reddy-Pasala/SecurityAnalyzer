@@ -3,6 +3,7 @@
 **Target:** `13.200.186.29` (AWS EC2 - ap-south-1)
 **Date:** 2026-02-25
 **Auditor:** SecurityAnalyzer v1.0.0
+**Scan Run:** Full 4-scanner analysis executed on 2026-02-25 01:36 IST
 **Classification:** CONFIDENTIAL
 
 ---
@@ -23,7 +24,7 @@ The Saturn UAT environment has **multiple critical and high-severity security is
 | HIGH     | 7     | Action required within 1 week |
 | MEDIUM   | 5     | Action required within 1 month |
 | LOW      | 3     | Best practice improvements |
-| INFO     | 2     | Informational |
+| INFO     | 4     | Informational |
 
 **Risk Rating: HIGH** - The environment is vulnerable to exploitation.
 
@@ -219,11 +220,22 @@ The Saturn UAT environment has **multiple critical and high-severity security is
 ### I1. All External Ports Filtered
 
 - **Description:** External port scan from our network showed all ports filtered/closed. Security groups may be partially configured but the SSH key + IP suggests direct access from specific networks.
-- **Evidence:** Scanned 18 common ports, all filtered from scan origin.
+- **Evidence:** Scanned 18 common ports (22, 80, 443, 3000, 4000, 5000, 5100, 8080, 8081, 8090, 8443, 9090, 8888, 27017, 6379, 4222, 5432, 3306), all filtered from scan origin. Also scanned alternate SSH ports (2222, 222, 2200, 8022) - all closed. HTTP probes on 14 ports returned no response. HTTPS probes on ports 443, 8443, 3443 returned no response.
 
 ### I2. ED25519 Key Type Used
 
-- **Description:** The SSH key uses ED25519 algorithm, which is the recommended modern key type. This is good practice.
+- **Description:** The SSH key uses ED25519 algorithm (256-bit, SHA256:rjt1WWsoWSnxQ9E+IJjIjNwppHi56q3urqD/KmYsfBs). This is the recommended modern key type. This is good practice.
+
+### I3. Server Responds to ICMP (Ping)
+
+- **Description:** Server responds to ICMP echo requests with ~52-67ms latency. This confirms the host is alive and ICMP is not blocked by security groups.
+- **Evidence:** `ping 13.200.186.29` - 2 packets transmitted, 2 received, 0% loss, RTT avg 59.9ms
+- **Note:** ICMP should also be restricted in security groups for UAT environments.
+
+### I4. Traceroute Dies After ISP Hops
+
+- **Description:** Traceroute reaches hop 4 (10.100.37.90/10.100.36.90) then all subsequent hops show `* * *`. This indicates packets are being dropped at the AWS edge or security group level.
+- **Evidence:** Traceroute 15 hops - passes through 192.168.70.1 (local) -> 10.100.136.42 (ISP) -> 10.100.37.90 (ISP) then dropped
 
 ---
 
@@ -271,6 +283,68 @@ python -m saturn_analyzer --host <IP> --network-only
 export SATURN_HOST=<IP>
 export SATURN_SSH_KEY_PATH=/path/to/key.pem
 python -m saturn_analyzer --config configs/sample_config.yaml
+```
+
+---
+
+## Live Scan Evidence (2026-02-25)
+
+### Automated Scanner Results
+
+The SecurityAnalyzer tool was executed against `13.200.186.29` with all 4 scanners:
+
+```
+[*] Saturn Security Analyzer v1.0.0
+[*] Target: 13.200.186.29
+
+[1/4] Network Scanner:     2 findings (Public IP, all ports filtered)
+[2/4] SSH Auditor:          1 finding  (SSH connection failed - port 22 blocked)
+[3/4] Service Scanner:      0 findings (could not connect via SSH)
+[4/4] Infrastructure Auditor: 2 findings (no VPN, no IP whitelist)
+Total: 5 automated findings
+```
+
+### Manual Probing Results
+
+| Test | Result |
+|------|--------|
+| TCP port scan (18 ports) | All filtered/closed |
+| Alternate SSH ports (2222, 222, 2200, 8022) | All closed |
+| HTTP probes (14 ports) | No response |
+| HTTPS probes (443, 8443, 3443) | No response |
+| ICMP ping | Responds (52-67ms, 0% loss) |
+| Traceroute | Dies after hop 4 (ISP edge) |
+| SSH key analysis | ED25519 256-bit, SHA256:rjt1WWsoWSnxQ9E+IJjIjNwppHi56q3urqD/KmYsfBs |
+
+### Key Observation
+
+All TCP ports are blocked from our scan origin, but the server is alive (ICMP responds). This means:
+- Security groups **partially** work (TCP is filtered)
+- But ICMP is allowed (should also be restricted)
+- SSH access works from specific IPs (user can connect with `ssh -i key ec2-user@13.200.186.29`)
+- **Once inside the network (via allowed IP), Saturn has NO authentication** - this is the critical gap
+
+### What Could NOT Be Tested (Requires SSH Access From Allowed IP)
+
+The following checks require re-running the tool from an authorized network:
+
+- [ ] sshd_config audit (password auth, root login, etc.)
+- [ ] Saturn process inspection (running as root? bound to 0.0.0.0?)
+- [ ] Saturn endpoint auth probing (unauthenticated API access)
+- [ ] Docker container exposure
+- [ ] Environment variable secrets
+- [ ] Hardcoded credentials in config files
+- [ ] OS patch level
+- [ ] SELinux status
+- [ ] fail2ban status
+- [ ] EC2 instance metadata (IMDSv1 vs v2)
+- [ ] IAM role permissions
+- [ ] EBS encryption status
+- [ ] CloudWatch/audit logging status
+
+**Action:** Re-run from allowed network:
+```bash
+python -m saturn_analyzer --host 13.200.186.29 --user ec2-user --key /path/to/tne-saturn-key-ed.pem
 ```
 
 ---
