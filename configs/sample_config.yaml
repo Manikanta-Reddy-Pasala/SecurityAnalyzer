@@ -1,0 +1,44 @@
+# Saturn Security Analyzer Configuration
+# IMPORTANT: Never commit real credentials. Use environment variables or a .env file.
+
+target:
+  host: "${SATURN_HOST}"          # e.g., 13.200.186.29
+  ssh_user: "${SATURN_SSH_USER}"  # e.g., ec2-user
+  ssh_key_path: "${SATURN_SSH_KEY_PATH}"  # path to PEM file
+
+scans:
+  network:
+    enabled: true
+    ports: "1-65535"               # port range to scan
+    common_ports: [22, 80, 443, 3000, 4000, 5000, 8080, 8443, 9090, 8888]
+    timeout_seconds: 5
+
+  ssh_audit:
+    enabled: true
+    check_key_strength: true
+    check_password_auth: true
+    check_root_login: true
+
+  service_discovery:
+    enabled: true
+    saturn_process_name: "saturn"
+    check_auth: true
+    check_tls: true
+
+  sast:
+    enabled: true
+    scan_paths: []                 # paths on remote server to scan
+    bandit_enabled: true
+    safety_check: true
+
+  infrastructure:
+    enabled: true
+    check_vpn: true
+    check_ip_whitelist: true
+    check_security_groups: true
+    check_firewall_rules: true
+
+report:
+  output_dir: "./reports"
+  format: "html"                   # html, json, markdown
+  severity_threshold: "LOW"        # LOW, MEDIUM, HIGH, CRITICAL

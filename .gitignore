@@ -1,0 +1,31 @@
+# Credentials - NEVER commit
+*.pem
+*.key
+*.env
+.env
+.env.*
+credentials/
+secrets/
+
+# Reports may contain sensitive data
+reports/*.json
+reports/*.html
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
