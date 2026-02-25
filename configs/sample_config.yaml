@@ -1,10 +1,10 @@
-# Saturn Security Analyzer Configuration
+# Security Analyzer Configuration
 # IMPORTANT: Never commit real credentials. Use environment variables or a .env file.
 
 target:
-  host: "${SATURN_HOST}"          # e.g., 13.200.186.29
-  ssh_user: "${SATURN_SSH_USER}"  # e.g., ec2-user
-  ssh_key_path: "${SATURN_SSH_KEY_PATH}"  # path to PEM file
+  host: "${SCAN_HOST}"          # e.g., 13.200.186.29
+  ssh_user: "${SCAN_SSH_USER}"  # e.g., ec2-user
+  ssh_key_path: "${SCAN_SSH_KEY_PATH}"  # path to PEM file
 
 scans:
   network:
@@ -21,15 +21,42 @@ scans:
 
   service_discovery:
     enabled: true
-    saturn_process_name: "saturn"
     check_auth: true
     check_tls: true
 
-  sast:
+  vpn:
     enabled: true
-    scan_paths: []                 # paths on remote server to scan
-    bandit_enabled: true
-    safety_check: true
+    check_wireguard: true
+    check_openvpn: true
+    check_ipsec: true
+    check_split_tunneling: true
+    check_dns_leak: true
+
+  auth:
+    enabled: true
+    check_default_creds: true
+    check_jwt: true
+    check_cors: true
+    check_session: true
+    check_rate_limit: true
+    check_mfa: true
+
+  payload_exposure:
+    enabled: true
+    check_debug_endpoints: true
+    check_proc: true
+    check_core_dumps: true
+    check_error_pages: true
+    check_source_code: true
+
+  binary_security:
+    enabled: true
+    check_aslr: true
+    check_pie: true
+    check_canary: true
+    check_relro: true
+    check_nx: true
+    check_suid: true
 
   infrastructure:
     enabled: true

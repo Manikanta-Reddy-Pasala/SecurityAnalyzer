@@ -2,7 +2,6 @@
 import json
 import datetime
 from collections import Counter
-from typing import Optional
 from .models import Finding, ScanResult, Severity
 
 
@@ -39,18 +38,18 @@ class ReportGenerator:
         severity_counts = Counter(f.severity.value for f in self.all_findings)
 
         lines = [
-            f"# Security Audit Report - Saturn UAT Environment",
-            f"",
+            "# Security Audit Report",
+            "",
             f"**Target:** `{self.target_host}`",
             f"**Date:** {now}",
             f"**Scanners:** {', '.join(sr.scanner_name for sr in self.scan_results)}",
-            f"",
-            f"---",
-            f"",
-            f"## Executive Summary",
-            f"",
-            f"| Severity | Count |",
-            f"|----------|-------|",
+            "",
+            "---",
+            "",
+            "## Executive Summary",
+            "",
+            "| Severity | Count |",
+            "|----------|-------|",
         ]
         for sev in ["CRITICAL", "HIGH", "MEDIUM", "LOW", "INFO"]:
             count = severity_counts.get(sev, 0)
@@ -58,15 +57,14 @@ class ReportGenerator:
             lines.append(f"| {emoji.get(sev, '')} {sev} | {count} |")
 
         lines.extend([
-            f"",
+            "",
             f"**Total Findings: {len(self.all_findings)}**",
-            f"",
-            f"---",
-            f"",
+            "",
+            "---",
+            "",
         ])
 
         sorted_findings = sorted(self.all_findings, key=self._severity_order)
-
         current_severity = None
         for i, f in enumerate(sorted_findings, 1):
             if f.severity != current_severity:
@@ -76,7 +74,7 @@ class ReportGenerator:
 
             lines.extend([
                 f"### {i}. {f.title}",
-                f"",
+                "",
                 f"- **Severity:** {f.severity.value}",
                 f"- **Category:** {f.category.value}",
                 f"- **Description:** {f.description}",
@@ -89,15 +87,14 @@ class ReportGenerator:
                 lines.append(f"- **Recommendation:** {f.recommendation}")
             lines.append("")
 
-        # Raw output section
         lines.extend(["---", "", "## Scanner Raw Output", ""])
         for sr in self.scan_results:
             if sr.raw_output:
                 lines.extend([
                     f"### {sr.scanner_name}",
-                    f"```",
+                    "```",
                     sr.raw_output[:3000],
-                    f"```",
+                    "```",
                     "",
                 ])
 
@@ -147,7 +144,7 @@ class ReportGenerator:
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Security Audit Report - Saturn UAT</title>
+<title>Security Audit Report</title>
 <style>
     * {{ margin: 0; padding: 0; box-sizing: border-box; }}
     body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;

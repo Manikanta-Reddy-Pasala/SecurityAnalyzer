@@ -1,8 +1,8 @@
-# Security Audit Report - Saturn UAT Environment
+# Security Audit Report
 
 **Target:** `13.200.186.29`
-**Date:** 2026-02-25 01:36:05
-**Scanners:** Network Scanner, SSH Auditor, Service Scanner, Infrastructure Auditor
+**Date:** 2026-02-25 21:54:52
+**Scanners:** Network Scanner, SSH Auditor, Service Scanner, Infrastructure Auditor, VPN Scanner, Auth Analyzer, Payload Exposure Scanner, Binary Vulnerability Scanner
 
 ---
 
@@ -10,13 +10,13 @@
 
 | Severity | Count |
 |----------|-------|
-| !!! CRITICAL | 1 |
-| !! HIGH | 1 |
+| !!! CRITICAL | 2 |
+| !! HIGH | 2 |
 | ! MEDIUM | 1 |
 | - LOW | 0 |
 | i INFO | 2 |
 
-**Total Findings: 5**
+**Total Findings: 7**
 
 ---
 
@@ -31,9 +31,18 @@
 - **CWE:** [CWE-284](https://cwe.mitre.org/data/definitions/284.html)
 - **Recommendation:** Deploy WireGuard or OpenVPN. Configure security groups to only allow traffic from VPN CIDR range.
 
+### 2. No VPN Tunnel Required for Access
+
+- **Severity:** CRITICAL
+- **Category:** VPN Security
+- **Description:** Environment is accessible without VPN. All non-production environments should require VPN to prevent unauthorized access.
+- **Evidence:** `Direct SSH/HTTP access possible without VPN`
+- **CWE:** [CWE-284](https://cwe.mitre.org/data/definitions/284.html)
+- **Recommendation:** Deploy WireGuard or OpenVPN. Configure security groups to only allow traffic from VPN CIDR range.
+
 ## HIGH Findings
 
-### 2. No IP Whitelisting Configured
+### 3. No IP Whitelisting Configured
 
 - **Severity:** HIGH
 - **Category:** Access Control
@@ -42,9 +51,18 @@
 - **CWE:** [CWE-284](https://cwe.mitre.org/data/definitions/284.html)
 - **Recommendation:** Configure AWS security groups with specific IP ranges. Use a bastion host pattern for SSH access.
 
+### 4. No VPN Service Detected
+
+- **Severity:** HIGH
+- **Category:** VPN Security
+- **Description:** No VPN service ports (WireGuard, OpenVPN, IPSec) were detected on the target host.
+- **Evidence:** `Checked ports: 1194, 51820, 500, 4500, 1701, 1723`
+- **CWE:** [CWE-284](https://cwe.mitre.org/data/definitions/284.html)
+- **Recommendation:** Deploy a VPN solution (WireGuard recommended) and restrict all service access to VPN clients only.
+
 ## MEDIUM Findings
 
-### 3. Public IP Address Detected
+### 5. Public IP Address Detected
 
 - **Severity:** MEDIUM
 - **Category:** Network Security
@@ -55,7 +73,7 @@
 
 ## INFO Findings
 
-### 4. All Scanned Ports Filtered
+### 6. All Scanned Ports Filtered
 
 - **Severity:** INFO
 - **Category:** Network Security
@@ -63,7 +81,7 @@
 - **Evidence:** `Scanned 18 ports, all filtered/closed`
 - **Recommendation:** Verify security group rules to confirm intentional filtering.
 
-### 5. SSH Connection Failed
+### 7. SSH Connection Failed
 
 - **Severity:** INFO
 - **Category:** SSH Configuration
@@ -90,5 +108,23 @@ SSH key permissions: 600
 Key info: 256 SHA256:rjt1WWsoWSnxQ9E+IJjIjNwppHi56q3urqD/KmYsfBs  (ED25519)
 Key type ED25519 - good
 Cannot establish SSH connection
+
+```
+
+### VPN Scanner
+```
+SSH not available, running external-only VPN checks
+
+```
+
+### Auth Analyzer
+```
+HTTP services found on ports: []
+
+```
+
+### Payload Exposure Scanner
+```
+Testing ports: []
 
 ```

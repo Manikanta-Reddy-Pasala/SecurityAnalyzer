@@ -1,36 +1,36 @@
-# Saturn Security Analyzer
+# Security Analyzer
 
-Security assessment toolkit for auditing UAT/staging environments and fuzzing C++ binary services.
+Comprehensive security assessment toolkit for auditing UAT/staging environments, binary services, VPN configurations, authentication mechanisms, and system payload exposure.
 
 ## Quick Start
 
 ```bash
-git clone https://github.com/Manikanta-Reddy-Pasala/SecurityAnalyzer.git
+git clone <repo-url>
 cd SecurityAnalyzer
 pip install -r requirements.txt
 ```
 
 ## Tools
 
-### 1. Security Scanner (4 scanners)
+### 1. Security Scanner (8 scanners)
 
-Audits network, SSH, services, and AWS infrastructure.
+Audits network, SSH, services, infrastructure, VPN, authentication, payload exposure, and binary security.
 
 ```bash
 # Full scan (needs SSH access)
-python -m saturn_analyzer --host <IP> --user ec2-user --key /path/to/key.pem
+python -m security_analyzer --host <IP> --user ec2-user --key /path/to/key.pem
 
 # Network-only scan (no SSH needed)
-python -m saturn_analyzer --host <IP> --network-only
+python -m security_analyzer --host <IP> --network-only
 
 # Using config file
-export SATURN_HOST=<IP>
-export SATURN_SSH_USER=ec2-user
-export SATURN_SSH_KEY_PATH=/path/to/key.pem
-python -m saturn_analyzer --config configs/sample_config.yaml
+export SCAN_HOST=<IP>
+export SCAN_SSH_USER=ec2-user
+export SCAN_SSH_KEY_PATH=/path/to/key.pem
+python -m security_analyzer --config configs/sample_config.yaml
 
 # Custom output directory
-python -m saturn_analyzer --host <IP> --network-only --output ./my-reports
+python -m security_analyzer --host <IP> --network-only --output ./my-reports
 ```
 
 **What it checks:**
@@ -39,33 +39,37 @@ python -m saturn_analyzer --host <IP> --network-only --output ./my-reports
 |---------|--------|
 | Network | Port scan, TLS validation, exposed databases, public IP, VPN requirement |
 | SSH | Key strength, sshd_config, password auth, root login, fail2ban, sudo NOPASSWD |
-| Service | Saturn process, auth probing, Docker containers, secrets in env/config, OS patches |
+| Service | Root services, auth probing, Docker containers, secrets in env/config, OS patches |
 | Infrastructure | IMDSv1/v2, security groups, IAM roles, disk encryption, logging, SELinux |
+| VPN | VPN presence (WireGuard/OpenVPN/IPSec), config security, split tunneling, DNS leaks |
+| Auth | Default creds, JWT vulnerabilities, CORS, session cookies, rate limiting, MFA, security headers |
+| Payload Exposure | Debug endpoints, error page leaks, stack traces, source code, /proc, core dumps, actuators |
+| Binary Security | ASLR, PIE, stack canaries, NX bit, RELRO, FORTIFY_SOURCE, SUID binaries, vulnerable libs |
 
 **Output:** Generates 3 report formats in `./reports/`:
 - `security-report.html` - visual report with severity bars
 - `security-report.md` - markdown for git/review
 - `security-report.json` - machine-readable for CI/CD
 
-### 2. Saturn Breaker (C++ binary fuzzer)
+### 2. Binary Fuzzer (service fuzzer)
 
-Tests 13 attack categories against a C++ binary service.
+Tests 13 attack categories against a binary service.
 
 ```bash
 # Discover open ports first, then test all of them
-python -m saturn_analyzer.saturn_breaker --host <IP> --discover
+python -m security_analyzer.binary_fuzzer --host <IP> --discover
 
 # Target a specific port
-python -m saturn_analyzer.saturn_breaker --host <IP> --port 8080
+python -m security_analyzer.binary_fuzzer --host <IP> --port 8080
 
 # Quick test (buffer overflow + format string only)
-python -m saturn_analyzer.saturn_breaker --host <IP> --port 8080 --quick
+python -m security_analyzer.binary_fuzzer --host <IP> --port 8080 --quick
 
 # Longer timeout for slow services
-python -m saturn_analyzer.saturn_breaker --host <IP> --port 8080 --timeout 10
+python -m security_analyzer.binary_fuzzer --host <IP> --port 8080 --timeout 10
 
 # Quiet mode (no per-test output)
-python -m saturn_analyzer.saturn_breaker --host <IP> --port 8080 --quiet
+python -m security_analyzer.binary_fuzzer --host <IP> --port 8080 --quiet
 ```
 
 **Attack categories:**
@@ -86,19 +90,19 @@ python -m saturn_analyzer.saturn_breaker --host <IP> --port 8080 --quiet
 | 12 | Auth Bypass | 30+ endpoints, JWT none algo, Basic brute, API key guessing |
 | 13 | Info Disclosure | `.git/config`, error pages, core dumps, source code, version info |
 
-**Output:** `reports/saturn-breaker-report.md` and `reports/saturn-breaker-report.json`
+**Output:** `reports/binary-fuzzer-report.md` and `reports/binary-fuzzer-report.json`
 
 ## Running Both Together
 
 ```bash
 # Step 1: Full infrastructure audit
-python -m saturn_analyzer --host <IP> --user ec2-user --key /path/to/key.pem
+python -m security_analyzer --host <IP> --user ec2-user --key /path/to/key.pem
 
-# Step 2: Find Saturn's port from the service scan output, then fuzz it
-python -m saturn_analyzer.saturn_breaker --host <IP> --port <SATURN_PORT>
+# Step 2: Fuzz service ports
+python -m security_analyzer.binary_fuzzer --host <IP> --port <PORT>
 
 # Or let it discover ports automatically
-python -m saturn_analyzer.saturn_breaker --host <IP> --discover
+python -m security_analyzer.binary_fuzzer --host <IP> --discover
 ```
 
 ## Config File
@@ -107,9 +111,9 @@ Copy and edit `configs/sample_config.yaml` for reusable settings. Uses environme
 
 ```yaml
 target:
-  host: "${SATURN_HOST}"
-  ssh_user: "${SATURN_SSH_USER}"
-  ssh_key_path: "${SATURN_SSH_KEY_PATH}"
+  host: "${SCAN_HOST}"
+  ssh_user: "${SCAN_SSH_USER}"
+  ssh_key_path: "${SCAN_SSH_KEY_PATH}"
 ```
 
 ## Reports
@@ -119,9 +123,8 @@ target:
 | `reports/security-report.html` | Visual HTML report |
 | `reports/security-report.md` | Markdown scan results |
 | `reports/security-report.json` | JSON for automation |
-| `reports/saturn-breaker-report.md` | Breaker findings |
-| `reports/saturn-breaker-report.json` | Breaker full data |
-| `reports/UAT-SECURITY-AUDIT-REPORT.md` | Manual audit report |
+| `reports/binary-fuzzer-report.md` | Fuzzer findings |
+| `reports/binary-fuzzer-report.json` | Fuzzer full data |
 
 ## Security
 

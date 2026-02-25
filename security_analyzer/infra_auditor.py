@@ -24,8 +24,14 @@ class InfraAuditor:
             self._check_security_groups_from_inside(result)
             self._check_network_config(result)
             self._check_disk_encryption(result)
+            self._check_swap_encryption(result)
             self._check_logging(result)
+            self._check_cloudtrail(result)
+            self._check_s3_buckets(result)
             self._check_time_sync(result)
+            self._check_backup_config(result)
+            self._check_ssm_agent(result)
+            self._check_tags(result)
         else:
             # External checks only
             self._check_vpn_requirement(result)
@@ -249,6 +255,198 @@ class InfraAuditor:
                 evidence=time_sync.strip(),
                 recommendation="Enable chrony: sudo systemctl enable --now chronyd",
             ))
+
+    def _check_swap_encryption(self, result: ScanResult):
+        """Check if swap space is encrypted."""
+        swap = self._run_remote("swapon --show 2>/dev/null")
+        if swap and swap.strip():
+            result.raw_output += f"--- Swap ---\n{swap}\n"
+            crypt_check = self._run_remote("dmsetup table 2>/dev/null | grep swap")
+            if not crypt_check or "crypt" not in (crypt_check or ""):
+                result.add_finding(Finding(
+                    title="Swap Space Not Encrypted",
+                    severity=Severity.MEDIUM,
+                    category=Category.INFRASTRUCTURE,
+                    description="Swap space is active but not encrypted. "
+                                "Sensitive data in memory can persist on disk via swap.",
+                    evidence=swap.strip()[:200],
+                    recommendation="Use encrypted swap or disable swap entirely.",
+                    cwe_id="CWE-311",
+                ))
+
+    def _check_cloudtrail(self, result: ScanResult):
+        """Check AWS CloudTrail configuration."""
+        ct = self._run_remote(
+            "aws cloudtrail describe-trails --output json 2>/dev/null"
+        )
+        if ct and "trailList" in ct:
+            try:
+                data = json.loads(ct)
+                trails = data.get("trailList", [])
+                if not trails:
+                    result.add_finding(Finding(
+                        title="No CloudTrail Trails Configured",
+                        severity=Severity.HIGH,
+                        category=Category.INFRASTRUCTURE,
+                        description="No CloudTrail trails found. API activity is not being logged.",
+                        evidence="Empty trailList from describe-trails",
+                        recommendation="Create a CloudTrail trail for all regions with S3 logging.",
+                        cwe_id="CWE-778",
+                    ))
+                else:
+                    for trail in trails:
+                        if not trail.get("IsMultiRegionTrail"):
+                            result.add_finding(Finding(
+                                title=f"CloudTrail Not Multi-Region: {trail.get('Name', 'unknown')}",
+                                severity=Severity.MEDIUM,
+                                category=Category.INFRASTRUCTURE,
+                                description="CloudTrail is not configured for all regions.",
+                                evidence=f"Trail: {trail.get('Name')}, MultiRegion: False",
+                                recommendation="Enable multi-region for the trail.",
+                            ))
+                        if not trail.get("LogFileValidationEnabled"):
+                            result.add_finding(Finding(
+                                title=f"CloudTrail Log Validation Disabled: {trail.get('Name', 'unknown')}",
+                                severity=Severity.MEDIUM,
+                                category=Category.INFRASTRUCTURE,
+                                description="CloudTrail log file validation is disabled. "
+                                            "Logs could be tampered with undetected.",
+                                evidence=f"Trail: {trail.get('Name')}, LogValidation: False",
+                                recommendation="Enable log file validation on the trail.",
+                                cwe_id="CWE-354",
+                            ))
+            except json.JSONDecodeError:
+                pass
+        elif ct is not None and "trailList" not in (ct or ""):
+            result.raw_output += "CloudTrail check: AWS CLI not configured or no permissions\n"
+
+    def _check_s3_buckets(self, result: ScanResult):
+        """Check S3 bucket security."""
+        buckets = self._run_remote("aws s3api list-buckets --output json 2>/dev/null")
+        if buckets and "Buckets" in buckets:
+            try:
+                data = json.loads(buckets)
+                for bucket in data.get("Buckets", [])[:10]:
+                    name = bucket.get("Name", "")
+                    # Check public access block
+                    pub = self._run_remote(
+                        f"aws s3api get-public-access-block --bucket {name} --output json 2>/dev/null"
+                    )
+                    if pub and "PublicAccessBlockConfiguration" in pub:
+                        pdata = json.loads(pub)
+                        config = pdata.get("PublicAccessBlockConfiguration", {})
+                        if not all([config.get("BlockPublicAcls"),
+                                    config.get("BlockPublicPolicy"),
+                                    config.get("IgnorePublicAcls"),
+                                    config.get("RestrictPublicBuckets")]):
+                            result.add_finding(Finding(
+                                title=f"S3 Bucket Public Access Not Fully Blocked: {name}",
+                                severity=Severity.HIGH,
+                                category=Category.INFRASTRUCTURE,
+                                description=f"S3 bucket {name} does not have all public access blocks enabled.",
+                                evidence=f"Bucket: {name}, Config: {config}",
+                                recommendation="Enable all public access block settings on the bucket.",
+                                cwe_id="CWE-284",
+                            ))
+                    elif pub and "NoSuchPublicAccessBlockConfiguration" in (pub or ""):
+                        result.add_finding(Finding(
+                            title=f"S3 Bucket Has No Public Access Block: {name}",
+                            severity=Severity.HIGH,
+                            category=Category.INFRASTRUCTURE,
+                            description=f"S3 bucket {name} has no public access block configuration.",
+                            evidence=f"Bucket: {name}",
+                            recommendation="Configure public access block for the bucket.",
+                            cwe_id="CWE-284",
+                        ))
+
+                    # Check encryption
+                    enc = self._run_remote(
+                        f"aws s3api get-bucket-encryption --bucket {name} --output json 2>/dev/null"
+                    )
+                    if not enc or "ServerSideEncryptionConfiguration" not in (enc or ""):
+                        result.add_finding(Finding(
+                            title=f"S3 Bucket Not Encrypted: {name}",
+                            severity=Severity.MEDIUM,
+                            category=Category.INFRASTRUCTURE,
+                            description=f"S3 bucket {name} does not have default encryption.",
+                            evidence=f"Bucket: {name}",
+                            recommendation="Enable default SSE-S3 or SSE-KMS encryption.",
+                            cwe_id="CWE-311",
+                        ))
+            except json.JSONDecodeError:
+                pass
+
+    def _check_backup_config(self, result: ScanResult):
+        """Check backup configuration."""
+        # Check for AWS Backup
+        backup = self._run_remote(
+            "aws backup list-backup-plans --output json 2>/dev/null"
+        )
+        if backup and "BackupPlansList" in backup:
+            try:
+                data = json.loads(backup)
+                if not data.get("BackupPlansList"):
+                    result.add_finding(Finding(
+                        title="No AWS Backup Plans Configured",
+                        severity=Severity.MEDIUM,
+                        category=Category.INFRASTRUCTURE,
+                        description="No AWS Backup plans found. Data may not be backed up.",
+                        evidence="Empty BackupPlansList",
+                        recommendation="Create AWS Backup plans for critical resources.",
+                    ))
+            except json.JSONDecodeError:
+                pass
+
+        # Check for local backup tools
+        backup_tools = self._run_remote(
+            "which restic borg duplicity 2>/dev/null; "
+            "systemctl list-units --type=timer 2>/dev/null | grep -i backup"
+        )
+        if backup_tools:
+            result.raw_output += f"Backup tools/timers: {backup_tools.strip()[:300]}\n"
+
+    def _check_ssm_agent(self, result: ScanResult):
+        """Check if AWS SSM agent is available (alternative to SSH)."""
+        ssm = self._run_remote("systemctl is-active amazon-ssm-agent 2>/dev/null || echo inactive")
+        if ssm and "inactive" in ssm:
+            result.add_finding(Finding(
+                title="AWS SSM Agent Not Running",
+                severity=Severity.LOW,
+                category=Category.INFRASTRUCTURE,
+                description="AWS SSM Agent is not running. SSM Session Manager provides "
+                            "audited, keyless access without opening SSH port.",
+                evidence="amazon-ssm-agent service inactive",
+                recommendation="Install and enable SSM agent as a more secure SSH alternative.",
+            ))
+
+    def _check_tags(self, result: ScanResult):
+        """Check if instance has required tags."""
+        instance_id = self._run_remote(
+            "curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null"
+        )
+        if instance_id and instance_id.strip():
+            tags = self._run_remote(
+                f"aws ec2 describe-tags --filters 'Name=resource-id,Values={instance_id.strip()}' "
+                f"--output json 2>/dev/null"
+            )
+            if tags and "Tags" in tags:
+                try:
+                    data = json.loads(tags)
+                    tag_keys = [t.get("Key", "").lower() for t in data.get("Tags", [])]
+                    required = ["environment", "owner", "name"]
+                    missing = [t for t in required if t not in tag_keys]
+                    if missing:
+                        result.add_finding(Finding(
+                            title=f"Missing Required Tags: {', '.join(missing)}",
+                            severity=Severity.LOW,
+                            category=Category.INFRASTRUCTURE,
+                            description=f"Instance is missing tags: {', '.join(missing)}. "
+                                        "Tags are needed for cost tracking and access control.",
+                            evidence=f"Existing tags: {', '.join(tag_keys)}",
+                            recommendation=f"Add missing tags: {', '.join(missing)}",
+                        ))
+                except json.JSONDecodeError:
+                    pass
 
     def _check_vpn_requirement(self, result: ScanResult):
         result.add_finding(Finding(

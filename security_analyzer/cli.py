@@ -1,4 +1,4 @@
-"""CLI entry point for Saturn Security Analyzer."""
+"""CLI entry point for Security Analyzer."""
 import argparse
 import os
 import sys
@@ -7,6 +7,10 @@ from .network_scanner import NetworkScanner
 from .ssh_auditor import SSHAuditor
 from .service_scanner import ServiceScanner
 from .infra_auditor import InfraAuditor
+from .vpn_scanner import VPNScanner
+from .auth_analyzer import AuthAnalyzer
+from .payload_scanner import PayloadScanner
+from .binary_scanner import BinaryScanner
 from .report_generator import ReportGenerator
 from .models import ScanResult
 
@@ -14,7 +18,6 @@ from .models import ScanResult
 def load_config(config_path: str) -> dict:
     with open(config_path) as f:
         raw = f.read()
-    # Substitute environment variables
     for key, val in os.environ.items():
         raw = raw.replace(f"${{{key}}}", val)
     return yaml.safe_load(raw)
@@ -25,56 +28,33 @@ def run_scan(host: str, user: str = "ec2-user",
              config_path: str = None) -> list[ScanResult]:
     results = []
 
-    print(f"[*] Saturn Security Analyzer v1.0.0")
+    print(f"[*] Security Analyzer v2.0.0")
     print(f"[*] Target: {host}")
     print(f"[*] Output: {output_dir}")
     print()
 
     os.makedirs(output_dir, exist_ok=True)
 
-    # 1. Network Scan
-    print("[1/4] Running Network Scanner...")
-    try:
-        net_scanner = NetworkScanner(host)
-        net_result = net_scanner.scan()
-        results.append(net_result)
-        print(f"      Found {len(net_result.findings)} findings")
-    except Exception as e:
-        print(f"      ERROR: {e}")
-        results.append(ScanResult(scanner_name="Network Scanner", success=False, error=str(e)))
+    scanners = [
+        ("1/8", "Network Scanner", lambda: NetworkScanner(host).scan()),
+        ("2/8", "SSH Auditor", lambda: SSHAuditor(host, user, key_path).audit()),
+        ("3/8", "Service Scanner", lambda: ServiceScanner(host, user, key_path).scan()),
+        ("4/8", "Infrastructure Auditor", lambda: InfraAuditor(host, user, key_path).audit()),
+        ("5/8", "VPN Scanner", lambda: VPNScanner(host, user, key_path).scan()),
+        ("6/8", "Auth Analyzer", lambda: AuthAnalyzer(host, user, key_path).scan()),
+        ("7/8", "Payload Exposure Scanner", lambda: PayloadScanner(host, user, key_path).scan()),
+        ("8/8", "Binary Vulnerability Scanner", lambda: BinaryScanner(host, user, key_path).scan()),
+    ]
 
-    # 2. SSH Audit
-    print("[2/4] Running SSH Auditor...")
-    try:
-        ssh_auditor = SSHAuditor(host, user, key_path)
-        ssh_result = ssh_auditor.audit()
-        results.append(ssh_result)
-        print(f"      Found {len(ssh_result.findings)} findings")
-    except Exception as e:
-        print(f"      ERROR: {e}")
-        results.append(ScanResult(scanner_name="SSH Auditor", success=False, error=str(e)))
-
-    # 3. Service Scan
-    print("[3/4] Running Service Scanner...")
-    try:
-        svc_scanner = ServiceScanner(host, user, key_path)
-        svc_result = svc_scanner.scan()
-        results.append(svc_result)
-        print(f"      Found {len(svc_result.findings)} findings")
-    except Exception as e:
-        print(f"      ERROR: {e}")
-        results.append(ScanResult(scanner_name="Service Scanner", success=False, error=str(e)))
-
-    # 4. Infrastructure Audit
-    print("[4/4] Running Infrastructure Auditor...")
-    try:
-        infra_auditor = InfraAuditor(host, user, key_path)
-        infra_result = infra_auditor.audit()
-        results.append(infra_result)
-        print(f"      Found {len(infra_result.findings)} findings")
-    except Exception as e:
-        print(f"      ERROR: {e}")
-        results.append(ScanResult(scanner_name="Infrastructure Auditor", success=False, error=str(e)))
+    for step, name, scan_fn in scanners:
+        print(f"[{step}] Running {name}...")
+        try:
+            scan_result = scan_fn()
+            results.append(scan_result)
+            print(f"      Found {len(scan_result.findings)} findings")
+        except Exception as e:
+            print(f"      ERROR: {e}")
+            results.append(ScanResult(scanner_name=name, success=False, error=str(e)))
 
     # Generate reports
     print()
@@ -94,20 +74,20 @@ def run_scan(host: str, user: str = "ec2-user",
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Saturn Security Analyzer - UAT Environment Security Assessment",
+        description="Security Analyzer - Environment Security Assessment",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic scan with SSH key
-  python -m saturn_analyzer --host 13.200.186.29 --user ec2-user --key ~/keys/server.pem
+  # Full scan with SSH key
+  python -m security_analyzer --host <IP> --user ec2-user --key ~/keys/server.pem
 
   # Using environment variables
-  export SATURN_HOST=13.200.186.29
-  export SATURN_SSH_KEY_PATH=~/keys/server.pem
-  python -m saturn_analyzer --config configs/sample_config.yaml
+  export SCAN_HOST=<IP>
+  export SCAN_SSH_KEY_PATH=~/keys/server.pem
+  python -m security_analyzer --config configs/sample_config.yaml
 
   # Network-only scan (no SSH required)
-  python -m saturn_analyzer --host 13.200.186.29 --network-only
+  python -m security_analyzer --host <IP> --network-only
         """,
     )
     parser.add_argument("--host", help="Target host IP or hostname")
@@ -119,7 +99,6 @@ Examples:
 
     args = parser.parse_args()
 
-    # Load from config if provided
     if args.config:
         config = load_config(args.config)
         host = args.host or config.get("target", {}).get("host", "")
@@ -133,7 +112,7 @@ Examples:
         output_dir = args.output
 
     if not host:
-        print("ERROR: --host is required (or set SATURN_HOST env var with --config)")
+        print("ERROR: --host is required (or set SCAN_HOST env var with --config)")
         sys.exit(1)
 
     if args.network_only:

@@ -23,6 +23,9 @@ class Category(Enum):
     SAST = "Static Analysis"
     SECRETS = "Secrets Management"
     ACCESS_CONTROL = "Access Control"
+    VPN = "VPN Security"
+    PAYLOAD_EXPOSURE = "System Payload Exposure"
+    BINARY_SECURITY = "Binary Security"
 
 
 @dataclass

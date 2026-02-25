@@ -1,4 +1,4 @@
-# Security Audit Report - Saturn UAT Environment
+# Security Audit Report - Application UAT Environment
 
 **Target:** `13.200.186.29` (AWS EC2 - ap-south-1)
 **Date:** 2026-02-25
@@ -10,10 +10,10 @@
 
 ## Executive Summary
 
-The Saturn UAT environment has **multiple critical and high-severity security issues** that expose the system to unauthorized access, data exfiltration, and potential full system compromise. The most urgent issues are:
+The Application UAT environment has **multiple critical and high-severity security issues** that expose the system to unauthorized access, data exfiltration, and potential full system compromise. The most urgent issues are:
 
 1. **No VPN/IP whitelisting** - UAT is directly accessible from the internet
-2. **No authentication on Saturn** - anyone with network access can use the service
+2. **No authentication on Application** - anyone with network access can use the service
 3. **SSH key shared in plaintext** - credential compromise
 4. **No SAST/DAST in CI/CD** - no automated security testing
 5. **Unknown patch status** - potential unpatched vulnerabilities
@@ -32,14 +32,14 @@ The Saturn UAT environment has **multiple critical and high-severity security is
 
 ## CRITICAL Findings
 
-### C1. No Authentication on Saturn Service
+### C1. No Authentication on Application Service
 
 - **Category:** Authentication & Authorization
 - **CWE:** [CWE-306](https://cwe.mitre.org/data/definitions/306.html) (Missing Authentication)
 - **CVSS 3.1:** 9.8 (Critical)
-- **Description:** Saturn service has no authentication mechanism. Any user with network access can interact with the service, execute operations, and potentially access or modify data.
-- **Evidence:** User confirmed "no auth for Saturn"
-- **Impact:** Complete unauthorized access to Saturn functionality. Attackers can read, modify, or delete data processed by Saturn.
+- **Description:** Application service has no authentication mechanism. Any user with network access can interact with the service, execute operations, and potentially access or modify data.
+- **Evidence:** User confirmed "no auth for Application"
+- **Impact:** Complete unauthorized access to Application functionality. Attackers can read, modify, or delete data processed by Application.
 - **Recommendation:**
   1. Implement API key authentication as minimum (quick fix)
   2. Deploy JWT/OAuth2 authentication (proper fix)
@@ -53,7 +53,7 @@ The Saturn UAT environment has **multiple critical and high-severity security is
 - **CVSS 3.1:** 9.1 (Critical)
 - **Description:** The UAT environment is accessible without VPN. Non-production environments containing test data (which often mirrors production) should never be directly internet-accessible.
 - **Evidence:** User confirmed "no VPN tunnel". Direct SSH access with `ssh -i key ec2-user@13.200.186.29`
-- **Impact:** Attackers can reach UAT services directly. Combined with no auth on Saturn, this means full unauthenticated access from anywhere on the internet.
+- **Impact:** Attackers can reach UAT services directly. Combined with no auth on Application, this means full unauthenticated access from anywhere on the internet.
 - **Recommendation:**
   1. Deploy WireGuard VPN (lightweight, fast setup)
   2. Configure security groups to allow only VPN CIDR
@@ -119,14 +119,14 @@ The Saturn UAT environment has **multiple critical and high-severity security is
 
 - **Category:** Infrastructure
 - **CWE:** [CWE-918](https://cwe.mitre.org/data/definitions/918.html) (SSRF)
-- **Description:** AWS EC2 instances have IMDSv1 enabled by default. If Saturn has an SSRF vulnerability, attackers can steal IAM credentials from the metadata service.
+- **Description:** AWS EC2 instances have IMDSv1 enabled by default. If Application has an SSRF vulnerability, attackers can steal IAM credentials from the metadata service.
 - **Recommendation:** Enforce IMDSv2: `aws ec2 modify-instance-metadata-options --instance-id <id> --http-tokens required`
 
 ### H3. SSH Key Potentially Reused Across Environments
 
 - **Category:** Access Control
 - **CWE:** CWE-798
-- **Description:** The SSH key name `tne-saturn-key-ed.pem` suggests it may be used specifically for Saturn. If the same key grants access to production or other environments, compromise scope expands.
+- **Description:** The SSH key name `server-key.pem` suggests it may be used specifically for Application. If the same key grants access to production or other environments, compromise scope expands.
 - **Recommendation:** Use unique SSH keys per environment. Implement AWS SSM Session Manager to eliminate SSH keys entirely.
 
 ### H4. No Host-Level Firewall (Likely)
@@ -157,18 +157,18 @@ The Saturn UAT environment has **multiple critical and high-severity security is
 
 ## MEDIUM Findings
 
-### M1. No Rate Limiting on Saturn
+### M1. No Rate Limiting on Application
 
 - **Category:** Service Security
 - **CWE:** [CWE-770](https://cwe.mitre.org/data/definitions/770.html)
-- **Description:** Without authentication or rate limiting, Saturn is vulnerable to abuse and denial of service.
+- **Description:** Without authentication or rate limiting, Application is vulnerable to abuse and denial of service.
 - **Recommendation:** Implement rate limiting (nginx rate limiting or application-level).
 
-### M2. No TLS/HTTPS for Saturn
+### M2. No TLS/HTTPS for Application
 
 - **Category:** TLS/SSL
 - **CWE:** [CWE-319](https://cwe.mitre.org/data/definitions/319.html)
-- **Description:** Saturn likely serves over HTTP without TLS encryption. Data in transit is unencrypted.
+- **Description:** Application likely serves over HTTP without TLS encryption. Data in transit is unencrypted.
 - **Recommendation:** Add TLS termination (nginx reverse proxy with Let's Encrypt or AWS ACM).
 
 ### M3. Unknown Dependency Vulnerability Status
@@ -198,7 +198,7 @@ The Saturn UAT environment has **multiple critical and high-severity security is
 ### L1. No Security Headers on HTTP Responses
 
 - **Category:** Service Security
-- **Description:** Saturn likely missing security headers (CSP, X-Frame-Options, HSTS, etc.).
+- **Description:** Application likely missing security headers (CSP, X-Frame-Options, HSTS, etc.).
 - **Recommendation:** Add security headers via reverse proxy configuration.
 
 ### L2. No Backup/DR Plan Documented
@@ -210,7 +210,7 @@ The Saturn UAT environment has **multiple critical and high-severity security is
 ### L3. No Network Segmentation
 
 - **Category:** Network Security
-- **Description:** Saturn and all services likely on the same subnet/VPC without network segmentation.
+- **Description:** Application and all services likely on the same subnet/VPC without network segmentation.
 - **Recommendation:** Use separate subnets for different tiers (web, app, data).
 
 ---
@@ -243,13 +243,13 @@ The Saturn UAT environment has **multiple critical and high-severity security is
 
 ### Immediate (This Week)
 1. **Rotate the exposed SSH key** - generate new key pair
-2. **Add authentication to Saturn** - even API key is better than nothing
+2. **Add authentication to Application** - even API key is better than nothing
 3. **Restrict security groups** - whitelist only office/developer IPs
 
 ### Short Term (2 Weeks)
 4. Deploy VPN (WireGuard is fastest to set up)
 5. Enforce IMDSv2 on EC2 instance
-6. Add TLS to Saturn (nginx reverse proxy + Let's Encrypt)
+6. Add TLS to Application (nginx reverse proxy + Let's Encrypt)
 7. Enable AWS GuardDuty
 
 ### Medium Term (1 Month)
@@ -274,15 +274,15 @@ The SecurityAnalyzer tool can be re-run for continuous monitoring:
 
 ```bash
 # Full scan (requires SSH access)
-python -m saturn_analyzer --host <IP> --user ec2-user --key /path/to/key.pem
+python -m security_analyzer --host <IP> --user ec2-user --key /path/to/key.pem
 
 # Network-only scan (no SSH needed)
-python -m saturn_analyzer --host <IP> --network-only
+python -m security_analyzer --host <IP> --network-only
 
 # With config file
-export SATURN_HOST=<IP>
-export SATURN_SSH_KEY_PATH=/path/to/key.pem
-python -m saturn_analyzer --config configs/sample_config.yaml
+export SCAN_HOST=<IP>
+export SCAN_SSH_KEY_PATH=/path/to/key.pem
+python -m security_analyzer --config configs/sample_config.yaml
 ```
 
 ---
@@ -294,7 +294,7 @@ python -m saturn_analyzer --config configs/sample_config.yaml
 The SecurityAnalyzer tool was executed against `13.200.186.29` with all 4 scanners:
 
 ```
-[*] Saturn Security Analyzer v1.0.0
+[*] Security Analyzer v1.0.0
 [*] Target: 13.200.186.29
 
 [1/4] Network Scanner:     2 findings (Public IP, all ports filtered)
@@ -322,15 +322,15 @@ All TCP ports are blocked from our scan origin, but the server is alive (ICMP re
 - Security groups **partially** work (TCP is filtered)
 - But ICMP is allowed (should also be restricted)
 - SSH access works from specific IPs (user can connect with `ssh -i key ec2-user@13.200.186.29`)
-- **Once inside the network (via allowed IP), Saturn has NO authentication** - this is the critical gap
+- **Once inside the network (via allowed IP), Application has NO authentication** - this is the critical gap
 
 ### What Could NOT Be Tested (Requires SSH Access From Allowed IP)
 
 The following checks require re-running the tool from an authorized network:
 
 - [ ] sshd_config audit (password auth, root login, etc.)
-- [ ] Saturn process inspection (running as root? bound to 0.0.0.0?)
-- [ ] Saturn endpoint auth probing (unauthenticated API access)
+- [ ] Application process inspection (running as root? bound to 0.0.0.0?)
+- [ ] Application endpoint auth probing (unauthenticated API access)
 - [ ] Docker container exposure
 - [ ] Environment variable secrets
 - [ ] Hardcoded credentials in config files
@@ -344,10 +344,10 @@ The following checks require re-running the tool from an authorized network:
 
 **Action:** Re-run from allowed network:
 ```bash
-python -m saturn_analyzer --host 13.200.186.29 --user ec2-user --key /path/to/tne-saturn-key-ed.pem
+python -m security_analyzer --host 13.200.186.29 --user ec2-user --key /path/to/server-key.pem
 ```
 
 ---
 
-*Report generated by Saturn Security Analyzer v1.0.0*
+*Report generated by Security Analyzer v2.0.0*
 *CONFIDENTIAL - Do not distribute outside the security team*

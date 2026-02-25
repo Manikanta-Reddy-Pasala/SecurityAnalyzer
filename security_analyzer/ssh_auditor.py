@@ -22,10 +22,13 @@ class SSHAuditor:
         # 2. Try SSH connection and audit remote config
         if self._can_connect():
             self._audit_sshd_config(result)
+            self._check_sshd_hardening(result)
             self._check_authorized_keys(result)
             self._check_ssh_banner(result)
             self._check_sudo_config(result)
             self._check_fail2ban(result)
+            self._check_ssh_host_keys(result)
+            self._check_ssh_logs(result)
         else:
             result.raw_output += "Cannot establish SSH connection\n"
             result.add_finding(Finding(
@@ -230,6 +233,205 @@ class SSHAuditor:
                 recommendation="Install and enable fail2ban: "
                                "sudo yum install fail2ban && sudo systemctl enable --now fail2ban",
             ))
+
+    def _check_sshd_hardening(self, result: ScanResult):
+        """Check additional sshd hardening settings."""
+        config = self._run_remote("sudo cat /etc/ssh/sshd_config 2>/dev/null || cat /etc/ssh/sshd_config 2>/dev/null")
+        if not config:
+            return
+
+        # Check ClientAliveInterval (idle timeout)
+        if "clientaliveinterval" not in config.lower():
+            result.add_finding(Finding(
+                title="No SSH Idle Timeout Configured",
+                severity=Severity.MEDIUM,
+                category=Category.SSH,
+                description="No ClientAliveInterval set. Idle SSH sessions remain "
+                            "open indefinitely, increasing hijacking risk.",
+                evidence="ClientAliveInterval not in sshd_config",
+                recommendation="Add 'ClientAliveInterval 300' and 'ClientAliveCountMax 2' "
+                               "to /etc/ssh/sshd_config.",
+            ))
+
+        # Check MaxAuthTries
+        max_auth_match = False
+        for line in config.split("\n"):
+            stripped = line.strip().lower()
+            if stripped.startswith("maxauthtries"):
+                max_auth_match = True
+                try:
+                    val = int(stripped.split()[-1])
+                    if val > 4:
+                        result.add_finding(Finding(
+                            title=f"SSH MaxAuthTries Too High ({val})",
+                            severity=Severity.MEDIUM,
+                            category=Category.SSH,
+                            description=f"MaxAuthTries is set to {val}. High values "
+                                        "allow more brute-force attempts per connection.",
+                            evidence=f"MaxAuthTries {val}",
+                            recommendation="Set 'MaxAuthTries 3' in sshd_config.",
+                            cwe_id="CWE-307",
+                        ))
+                except ValueError:
+                    pass
+        if not max_auth_match:
+            result.add_finding(Finding(
+                title="SSH MaxAuthTries Not Set (Default: 6)",
+                severity=Severity.LOW,
+                category=Category.SSH,
+                description="MaxAuthTries not explicitly set, defaults to 6.",
+                evidence="MaxAuthTries not in sshd_config",
+                recommendation="Set 'MaxAuthTries 3' in sshd_config.",
+                cwe_id="CWE-307",
+            ))
+
+        # Check LoginGraceTime
+        if "logingracetime" not in config.lower():
+            result.add_finding(Finding(
+                title="SSH LoginGraceTime Not Set",
+                severity=Severity.LOW,
+                category=Category.SSH,
+                description="LoginGraceTime not set. Default is 120s, which is excessive.",
+                evidence="LoginGraceTime not in sshd_config",
+                recommendation="Set 'LoginGraceTime 30' in sshd_config.",
+            ))
+
+        # Check for weak ciphers
+        for line in config.split("\n"):
+            stripped = line.strip().lower()
+            if stripped.startswith("ciphers"):
+                weak_ssh_ciphers = ["3des-cbc", "aes128-cbc", "aes256-cbc",
+                                     "blowfish-cbc", "cast128-cbc"]
+                for wc in weak_ssh_ciphers:
+                    if wc in stripped:
+                        result.add_finding(Finding(
+                            title=f"Weak SSH Cipher Allowed: {wc}",
+                            severity=Severity.MEDIUM,
+                            category=Category.SSH,
+                            description=f"SSH allows weak cipher {wc}. CBC mode ciphers "
+                                        "are vulnerable to padding oracle attacks.",
+                            evidence=line.strip(),
+                            recommendation="Use only AES-GCM and ChaCha20 ciphers: "
+                                           "Ciphers chacha20-poly1305@openssh.com,"
+                                           "aes256-gcm@openssh.com,aes128-gcm@openssh.com",
+                            cwe_id="CWE-327",
+                        ))
+                        break
+
+        # Check for weak MACs
+        for line in config.split("\n"):
+            stripped = line.strip().lower()
+            if stripped.startswith("macs"):
+                weak_macs = ["hmac-md5", "hmac-sha1", "umac-64"]
+                for wm in weak_macs:
+                    if wm in stripped and "etm" not in stripped.split(wm)[0][-5:]:
+                        result.add_finding(Finding(
+                            title=f"Weak SSH MAC Allowed: {wm}",
+                            severity=Severity.MEDIUM,
+                            category=Category.SSH,
+                            description=f"SSH allows weak MAC {wm}.",
+                            evidence=line.strip(),
+                            recommendation="Use only ETM MACs: MACs hmac-sha2-512-etm@openssh.com,"
+                                           "hmac-sha2-256-etm@openssh.com",
+                            cwe_id="CWE-327",
+                        ))
+                        break
+
+        # Check for TCP forwarding
+        if "allowtcpforwarding yes" in config.lower() or "allowtcpforwarding" not in config.lower():
+            result.add_finding(Finding(
+                title="SSH TCP Forwarding Allowed",
+                severity=Severity.LOW,
+                category=Category.SSH,
+                description="SSH TCP forwarding is allowed. Can be used to tunnel "
+                            "traffic through the server.",
+                evidence="AllowTcpForwarding yes or not set",
+                recommendation="Set 'AllowTcpForwarding no' unless required.",
+            ))
+
+        # Check for agent forwarding
+        if "allowagentforwarding yes" in config.lower():
+            result.add_finding(Finding(
+                title="SSH Agent Forwarding Enabled",
+                severity=Severity.MEDIUM,
+                category=Category.SSH,
+                description="SSH agent forwarding is enabled. A compromised server "
+                            "can use forwarded keys to access other hosts.",
+                evidence="AllowAgentForwarding yes in sshd_config",
+                recommendation="Set 'AllowAgentForwarding no' in sshd_config.",
+                cwe_id="CWE-284",
+            ))
+
+    def _check_ssh_host_keys(self, result: ScanResult):
+        """Check SSH host key algorithms and strength."""
+        host_keys = self._run_remote("ls -la /etc/ssh/ssh_host_*_key 2>/dev/null")
+        if host_keys:
+            result.raw_output += f"--- SSH Host Keys ---\n{host_keys}\n"
+            if "ssh_host_dsa_key" in host_keys:
+                result.add_finding(Finding(
+                    title="DSA SSH Host Key Present",
+                    severity=Severity.HIGH,
+                    category=Category.SSH,
+                    description="DSA host key is present. DSA is deprecated and limited to 1024 bits.",
+                    evidence="ssh_host_dsa_key exists",
+                    recommendation="Remove DSA host key and disable in sshd_config: "
+                                   "rm /etc/ssh/ssh_host_dsa_key*",
+                    cwe_id="CWE-326",
+                ))
+            if "ssh_host_ecdsa_key" not in host_keys and "ssh_host_ed25519_key" not in host_keys:
+                result.add_finding(Finding(
+                    title="No Modern SSH Host Keys (Ed25519/ECDSA)",
+                    severity=Severity.MEDIUM,
+                    category=Category.SSH,
+                    description="No Ed25519 or ECDSA host key found. Only older key types available.",
+                    evidence="Missing ssh_host_ed25519_key and ssh_host_ecdsa_key",
+                    recommendation="Generate Ed25519 host key: ssh-keygen -t ed25519 -f /etc/ssh/ssh_host_ed25519_key",
+                    cwe_id="CWE-326",
+                ))
+
+    def _check_ssh_logs(self, result: ScanResult):
+        """Check SSH login logs for anomalies."""
+        failed_logins = self._run_remote(
+            "grep -c 'Failed password' /var/log/auth.log /var/log/secure 2>/dev/null | "
+            "tail -1"
+        )
+        if failed_logins:
+            try:
+                count = int(failed_logins.strip().split(":")[-1])
+                if count > 100:
+                    result.add_finding(Finding(
+                        title=f"High Number of Failed SSH Logins ({count})",
+                        severity=Severity.HIGH,
+                        category=Category.SSH,
+                        description=f"Found {count} failed SSH login attempts in auth logs. "
+                                    "This may indicate brute-force attacks.",
+                        evidence=f"{count} failed password entries in auth logs",
+                        recommendation="Ensure fail2ban is active. Consider changing SSH port. "
+                                       "Use key-only authentication.",
+                        cwe_id="CWE-307",
+                    ))
+            except ValueError:
+                pass
+
+        # Check for root login attempts
+        root_attempts = self._run_remote(
+            "grep -c 'user root' /var/log/auth.log /var/log/secure 2>/dev/null | tail -1"
+        )
+        if root_attempts:
+            try:
+                count = int(root_attempts.strip().split(":")[-1])
+                if count > 50:
+                    result.add_finding(Finding(
+                        title=f"Root Login Attempts Detected ({count})",
+                        severity=Severity.MEDIUM,
+                        category=Category.SSH,
+                        description=f"Found {count} root login attempts in SSH logs.",
+                        evidence=f"{count} root login attempts",
+                        recommendation="Disable root login: PermitRootLogin no",
+                        cwe_id="CWE-307",
+                    ))
+            except ValueError:
+                pass
 
     def _check_ssh_auth_methods(self, result: ScanResult):
         try:
