@@ -16,6 +16,7 @@ from .java_scanner import JavaScanner
 from .secrets_scanner import SecretsScanner
 from .container_scanner import ContainerScanner
 from .runtime_scanner import RuntimeScanner
+from .image_scanner import ImageScanner
 from .report_generator import ReportGenerator
 from .models import ScanResult
 
@@ -91,22 +92,72 @@ def run_scan(host: str, user: str = "ec2-user",
     return results
 
 
+def run_image_scan(images: list[str], output_dir: str = "./reports",
+                   debug: bool = False) -> list[ScanResult]:
+    """Scan one or more Docker images locally — no SSH required."""
+    results = []
+
+    print(f"[*] Security Analyzer v2.3.0 — Image Scanner")
+    print(f"[*] Images: {', '.join(images)}")
+    print(f"[*] Output: {output_dir}")
+    if debug:
+        print(f"[*] Debug mode: ON")
+    print()
+
+    os.makedirs(output_dir, exist_ok=True)
+
+    for idx, image in enumerate(images, 1):
+        print(f"[{idx}/{len(images)}] Scanning image: {image} ...")
+        try:
+            scanner = ImageScanner(image)
+            scan_result = scanner.scan()
+            results.append(scan_result)
+            print(f"      Found {len(scan_result.findings)} findings")
+            if debug and scan_result.raw_output and scan_result.raw_output.strip():
+                print(f"\n--- Image Scanner Raw Output: {image} ---")
+                print(scan_result.raw_output[:8000])
+                print(f"--- End Raw Output ---\n")
+        except Exception as e:
+            print(f"      ERROR: {e}")
+            results.append(ScanResult(
+                scanner_name=f"Image Scanner ({image})", success=False, error=str(e)
+            ))
+
+    # Generate reports
+    print()
+    print("[*] Generating reports...")
+    # Use first image name as the "host" label in reports
+    label = images[0] if images else "image-scan"
+    generator = ReportGenerator(results, label)
+    generator.generate_html(os.path.join(output_dir, "security-report.html"))
+    generator.generate_markdown(os.path.join(output_dir, "security-report.md"))
+    generator.generate_json(os.path.join(output_dir, "security-report.json"))
+
+    total = sum(len(r.findings) for r in results)
+    print(f"[*] Total findings: {total}")
+    print(f"[*] Reports saved to {output_dir}/")
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Security Analyzer - Environment Security Assessment",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Full scan with SSH key
+  # Full SSH-based scan
   python -m security_analyzer --host <IP> --user ec2-user --key ~/keys/server.pem
 
-  # Using environment variables
+  # Using a YAML config file
   export SCAN_HOST=<IP>
-  export SCAN_SSH_KEY_PATH=~/keys/server.pem
   python -m security_analyzer --config configs/sample_config.yaml
 
   # Network-only scan (no SSH required)
   python -m security_analyzer --host <IP> --network-only
+
+  # Scan a Docker image locally (NO SSH required)
+  python -m security_analyzer --image nginx:latest
+  python -m security_analyzer --image myrepo/myapp:1.2.3 --image redis:7-alpine
         """,
     )
     parser.add_argument("--host", help="Target host IP or hostname")
@@ -116,9 +167,19 @@ Examples:
     parser.add_argument("--output", default="./reports", help="Output directory (default: ./reports)")
     parser.add_argument("--network-only", action="store_true", help="Run network scan only (no SSH)")
     parser.add_argument("--debug", action="store_true", help="Print raw scanner output for debugging")
+    parser.add_argument(
+        "--image", dest="images", action="append", metavar="IMAGE",
+        help="Docker image to scan locally (no SSH needed). Can be repeated for multiple images.",
+    )
 
     args = parser.parse_args()
 
+    # ── Image scan mode (no SSH) ─────────────────────────────────────────────
+    if args.images:
+        run_image_scan(args.images, output_dir=args.output, debug=args.debug)
+        return
+
+    # ── SSH-based scan modes ─────────────────────────────────────────────────
     if args.config:
         config = load_config(args.config)
         host = args.host or config.get("target", {}).get("host", "")
@@ -132,7 +193,7 @@ Examples:
         output_dir = args.output
 
     if not host:
-        print("ERROR: --host is required (or set SCAN_HOST env var with --config)")
+        print("ERROR: --host is required (or use --image for local image scanning)")
         sys.exit(1)
 
     if args.network_only:
