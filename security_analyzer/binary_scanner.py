@@ -1,4 +1,5 @@
 """Binary vulnerability scanner - ELF binary security analysis."""
+import re
 import subprocess
 from typing import Optional
 from .models import Finding, ScanResult, Severity, Category
@@ -43,6 +44,9 @@ class BinaryScanner:
         self._check_apparmor(result)
         self._check_coredump_filter(result)
         self._check_mprotect(result)
+
+        # Discover running binaries, their listening ports, and probe protocol data
+        self._check_running_binary_ports(result)
 
         return result
 
@@ -509,4 +513,164 @@ class BinaryScanner:
                     evidence=f"mmap_min_addr = {val}",
                     recommendation="Set vm.mmap_min_addr = 65536",
                     cwe_id="CWE-119",
+                ))
+
+    def _check_running_binary_ports(self, result: ScanResult):
+        """Discover running binaries, their listening TCP ports, and probe protocol/data."""
+        result.raw_output += "\n--- Running Binaries & Listening Ports ---\n"
+
+        # Get all listening TCP sockets with process info
+        ss_out = self._run_remote("ss -tlnp 2>/dev/null")
+        if not ss_out:
+            result.raw_output += "Could not retrieve listening port information (ss not available)\n"
+            return
+
+        result.raw_output += ss_out + "\n"
+
+        # Parse each LISTEN line: extract local address:port + process name + PID
+        entries = []
+        for line in ss_out.strip().splitlines():
+            if "LISTEN" not in line and not line.startswith("State"):
+                continue
+            if "LISTEN" not in line:
+                continue
+            # Local address column (4th field) — extract port after last colon
+            parts = line.split()
+            if len(parts) < 5:
+                continue
+            local_addr = parts[3]
+            port_match = re.search(r':(\d+)$', local_addr)
+            if not port_match:
+                continue
+            port = port_match.group(1)
+
+            # Process column (last field) — extract name and pid
+            proc_col = parts[-1] if len(parts) >= 6 else ""
+            name_match = re.search(r'"([^"]+)"', proc_col)
+            pid_match = re.search(r'pid=(\d+)', proc_col)
+            name = name_match.group(1) if name_match else "unknown"
+            pid = pid_match.group(1) if pid_match else None
+
+            entries.append({"port": port, "pid": pid, "name": name})
+
+        if not entries:
+            result.raw_output += "No listening processes detected via ss.\n"
+            return
+
+        result.raw_output += f"\nDetected {len(entries)} listening process(es):\n"
+
+        for entry in entries:
+            port = entry["port"]
+            pid = entry["pid"]
+            name = entry["name"]
+
+            # Resolve full binary path from /proc/<pid>/exe
+            exe = ""
+            if pid:
+                exe_out = self._run_remote(
+                    f"readlink -f /proc/{pid}/exe 2>/dev/null"
+                )
+                exe = exe_out.strip() if exe_out else ""
+
+            # --- Protocol / data probe ---
+            # 1) Try HTTP GET
+            banner = self._run_remote(
+                f"timeout 2 bash -c "
+                f"'printf \"GET / HTTP/1.0\\r\\nHost: localhost\\r\\n\\r\\n\" "
+                f"| nc -w2 127.0.0.1 {port} 2>/dev/null | head -5' 2>/dev/null"
+            )
+            proto = "HTTP" if banner and ("HTTP/" in banner or "html" in banner.lower()) else None
+
+            # 2) If no HTTP response, try raw banner grab (server speaks first)
+            if not banner or not banner.strip():
+                banner = self._run_remote(
+                    f"timeout 2 bash -c "
+                    f"'nc -w2 127.0.0.1 {port} </dev/null 2>/dev/null | head -3' 2>/dev/null"
+                )
+                if banner and banner.strip():
+                    proto = "RAW/UNKNOWN"
+
+            # 3) Detect protocol hints from banner content
+            if banner and banner.strip():
+                b = banner.lower()
+                if "ssh" in b:
+                    proto = "SSH"
+                elif "smtp" in b or "220 " in b:
+                    proto = "SMTP"
+                elif "ftp" in b:
+                    proto = "FTP"
+                elif "grpc" in b or "h2" in b:
+                    proto = "gRPC/HTTP2"
+                elif "http/" in b:
+                    proto = "HTTP"
+                elif "mongod" in b or "mongodb" in b:
+                    proto = "MongoDB"
+                elif "redis" in b:
+                    proto = "Redis"
+
+            proto_str = proto or "UNKNOWN"
+            banner_str = banner.strip()[:200] if banner and banner.strip() else "(no data)"
+
+            result.raw_output += (
+                f"  Port {port:>5} | {proto_str:<12} | {name} (PID {pid}) -> {exe or 'unknown'}\n"
+                f"           Data: {banner_str[:120]}\n"
+            )
+
+            # --- Create informational finding for each exposed service ---
+            result.add_finding(Finding(
+                title=f"Running Binary on Port {port}: {name} [{proto_str}]",
+                severity=Severity.INFO,
+                category=Category.BINARY_SECURITY,
+                description=(
+                    f"Process '{name}' (PID {pid}) is listening on TCP port {port} "
+                    f"using protocol {proto_str}. "
+                    f"Binary path: {exe or 'unknown'}."
+                ),
+                evidence=(
+                    f"port={port}, binary={exe or name}, proto={proto_str}"
+                    + (f", data={banner_str[:120]}" if banner_str != "(no data)" else "")
+                ),
+                recommendation=(
+                    "Verify this service is intentionally exposed. Ensure authentication, "
+                    "TLS encryption, and network-level access controls are in place."
+                ),
+            ))
+
+            # --- Flag version/software disclosure in banner ---
+            if banner and banner.strip():
+                disclosure_keywords = [
+                    "server:", "x-powered-by:", "via:", "x-generator:",
+                    "apache", "nginx", "tomcat", "jetty", "express",
+                    "version", "openssl", "openssh",
+                ]
+                if any(kw in banner.lower() for kw in disclosure_keywords):
+                    result.add_finding(Finding(
+                        title=f"Version Disclosure on Port {port} ({name})",
+                        severity=Severity.LOW,
+                        category=Category.BINARY_SECURITY,
+                        description=(
+                            f"Service '{name}' on port {port} reveals software version "
+                            f"information in its response, aiding fingerprinting and targeted attacks."
+                        ),
+                        evidence=banner_str[:200],
+                        recommendation=(
+                            "Suppress version headers: ServerTokens Prod (Apache), "
+                            "server_tokens off (Nginx), or the equivalent for your stack."
+                        ),
+                        cwe_id="CWE-200",
+                    ))
+
+            # --- Flag unencrypted HTTP on non-standard ports ---
+            if proto == "HTTP" and port not in ("80", "8080", "3000", "9090"):
+                result.add_finding(Finding(
+                    title=f"Unencrypted HTTP on Non-Standard Port {port}",
+                    severity=Severity.MEDIUM,
+                    category=Category.BINARY_SECURITY,
+                    description=(
+                        f"Binary '{name}' serves unencrypted HTTP on port {port}. "
+                        f"Traffic is not protected by TLS."
+                    ),
+                    evidence=f"Port {port} responded with plain HTTP",
+                    recommendation="Configure TLS/HTTPS or restrict access to localhost only.",
+                    cwe_id="CWE-319",
                 ))
