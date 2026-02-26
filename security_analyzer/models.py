@@ -26,6 +26,8 @@ class Category(Enum):
     VPN = "VPN Security"
     PAYLOAD_EXPOSURE = "System Payload Exposure"
     BINARY_SECURITY = "Binary Security"
+    DATABASE = "Database Security"
+    JAVA_JVM = "Java/JVM Security"
 
 
 @dataclass

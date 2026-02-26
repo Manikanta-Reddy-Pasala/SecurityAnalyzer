@@ -11,6 +11,8 @@ from .vpn_scanner import VPNScanner
 from .auth_analyzer import AuthAnalyzer
 from .payload_scanner import PayloadScanner
 from .binary_scanner import BinaryScanner
+from .database_scanner import DatabaseScanner
+from .java_scanner import JavaScanner
 from .report_generator import ReportGenerator
 from .models import ScanResult
 
@@ -36,14 +38,16 @@ def run_scan(host: str, user: str = "ec2-user",
     os.makedirs(output_dir, exist_ok=True)
 
     scanners = [
-        ("1/8", "Network Scanner", lambda: NetworkScanner(host).scan()),
-        ("2/8", "SSH Auditor", lambda: SSHAuditor(host, user, key_path).audit()),
-        ("3/8", "Service Scanner", lambda: ServiceScanner(host, user, key_path).scan()),
-        ("4/8", "Infrastructure Auditor", lambda: InfraAuditor(host, user, key_path).audit()),
-        ("5/8", "VPN Scanner", lambda: VPNScanner(host, user, key_path).scan()),
-        ("6/8", "Auth Analyzer", lambda: AuthAnalyzer(host, user, key_path).scan()),
-        ("7/8", "Payload Exposure Scanner", lambda: PayloadScanner(host, user, key_path).scan()),
-        ("8/8", "Binary Vulnerability Scanner", lambda: BinaryScanner(host, user, key_path).scan()),
+        ("1/10", "Network Scanner",            lambda: NetworkScanner(host).scan()),
+        ("2/10", "SSH Auditor",                lambda: SSHAuditor(host, user, key_path).audit()),
+        ("3/10", "Service Scanner",            lambda: ServiceScanner(host, user, key_path).scan()),
+        ("4/10", "Infrastructure Auditor",     lambda: InfraAuditor(host, user, key_path).audit()),
+        ("5/10", "VPN Scanner",                lambda: VPNScanner(host, user, key_path).scan()),
+        ("6/10", "Auth Analyzer",              lambda: AuthAnalyzer(host, user, key_path).scan()),
+        ("7/10", "Payload Exposure Scanner",   lambda: PayloadScanner(host, user, key_path).scan()),
+        ("8/10", "Binary Vulnerability Scanner", lambda: BinaryScanner(host, user, key_path).scan()),
+        ("9/10", "Database Scanner",           lambda: DatabaseScanner(host, user, key_path).scan()),
+        ("10/10", "Java/JVM Scanner",          lambda: JavaScanner(host, user, key_path).scan()),
     ]
 
     for step, name, scan_fn in scanners:
