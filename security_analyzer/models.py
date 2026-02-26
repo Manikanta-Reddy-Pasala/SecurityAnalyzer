@@ -28,6 +28,7 @@ class Category(Enum):
     BINARY_SECURITY = "Binary Security"
     DATABASE = "Database Security"
     JAVA_JVM = "Java/JVM Security"
+    CONTAINER = "Container Security"
 
 
 @dataclass
