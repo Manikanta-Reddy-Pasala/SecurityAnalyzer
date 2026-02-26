@@ -30,12 +30,14 @@ def load_config(config_path: str) -> dict:
 
 def run_scan(host: str, user: str = "ec2-user",
              key_path: str = None, output_dir: str = "./reports",
-             config_path: str = None) -> list[ScanResult]:
+             config_path: str = None, debug: bool = False) -> list[ScanResult]:
     results = []
 
-    print(f"[*] Security Analyzer v2.2.0")
+    print(f"[*] Security Analyzer v2.3.0")
     print(f"[*] Target: {host}")
     print(f"[*] Output: {output_dir}")
+    if debug:
+        print(f"[*] Debug mode: ON (raw scanner output will be printed)")
     print()
 
     os.makedirs(output_dir, exist_ok=True)
@@ -62,6 +64,13 @@ def run_scan(host: str, user: str = "ec2-user",
             scan_result = scan_fn()
             results.append(scan_result)
             print(f"      Found {len(scan_result.findings)} findings")
+            # Always print Runtime Scanner raw output (it contains diagnostics)
+            # Also print any scanner raw output in debug mode
+            if debug or (name == "Runtime Language Scanner" and len(scan_result.findings) == 0):
+                if scan_result.raw_output and scan_result.raw_output.strip():
+                    print(f"\n--- {name} Raw Output ---")
+                    print(scan_result.raw_output[:8000])
+                    print(f"--- End {name} Raw Output ---\n")
         except Exception as e:
             print(f"      ERROR: {e}")
             results.append(ScanResult(scanner_name=name, success=False, error=str(e)))
@@ -106,6 +115,7 @@ Examples:
     parser.add_argument("--config", help="Path to YAML config file")
     parser.add_argument("--output", default="./reports", help="Output directory (default: ./reports)")
     parser.add_argument("--network-only", action="store_true", help="Run network scan only (no SSH)")
+    parser.add_argument("--debug", action="store_true", help="Print raw scanner output for debugging")
 
     args = parser.parse_args()
 
@@ -136,7 +146,7 @@ Examples:
         generator.generate_json(os.path.join(output_dir, "security-report.json"))
         print(f"[*] Reports saved to {output_dir}/")
     else:
-        run_scan(host, user, key_path, output_dir)
+        run_scan(host, user, key_path, output_dir, debug=args.debug)
 
 
 if __name__ == "__main__":

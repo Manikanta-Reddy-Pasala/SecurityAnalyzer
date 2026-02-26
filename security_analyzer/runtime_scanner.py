@@ -2,6 +2,7 @@
 classifies it by language/runtime, and applies language-specific deep security
 checks: C/C++, Java/Kotlin, Python, Node.js, Go, Ruby, Rust.
 """
+import base64
 import re
 import subprocess
 from typing import Optional
@@ -245,32 +246,95 @@ class RuntimeScanner:
             })
         return procs
 
-    def _get_container_procs(self, cid: str) -> list[dict]:
+    def _get_ns_procs(self, init_pid: str) -> list[dict]:
+        """Find ALL processes in the same PID namespace as init_pid by walking /proc.
+
+        Uses base64-encoded script to avoid shell quoting issues.
+        Returns HOST-namespace PIDs — works for distroless/Alpine/any container.
+        """
+        # Script: find all pids sharing the same pid namespace as init_pid
+        # Read cmdline (null-separated → space-separated), user from /proc/<pid>/status
+        script = (
+            f'INIT={init_pid}\n'
+            'NS=$(readlink /proc/$INIT/ns/pid 2>/dev/null)\n'
+            '[ -z "$NS" ] && exit 1\n'
+            'for pid in $(ls /proc/ 2>/dev/null); do\n'
+            '  [ -z "${pid##*[!0-9]*}" ] && continue\n'
+            '  pns=$(readlink /proc/$pid/ns/pid 2>/dev/null)\n'
+            '  [ "$pns" != "$NS" ] && continue\n'
+            '  cmdline=$(cat /proc/$pid/cmdline 2>/dev/null | tr "\\000" " ")\n'
+            '  [ -z "$cmdline" ] && continue\n'
+            '  uid=$(awk \'/^Uid:/{print $2;exit}\' /proc/$pid/status 2>/dev/null)\n'
+            '  printf "%s\\t%s\\t%s\\n" "$pid" "${uid:-0}" "$cmdline"\n'
+            'done\n'
+        )
+        encoded = base64.b64encode(script.encode()).decode()
+        out = self._run_remote(f"echo {encoded} | base64 -d | bash 2>/dev/null", timeout=20)
+        if not out or not out.strip():
+            return []
+
+        procs = []
+        for line in out.strip().splitlines():
+            parts = line.split('\t', 2)
+            if len(parts) >= 1 and parts[0].strip().isdigit():
+                procs.append({
+                    "pid": parts[0].strip(),
+                    "user": parts[1].strip() if len(parts) > 1 else "?",
+                    "cmdline": parts[2].strip() if len(parts) > 2 else "",
+                    "_host_pid": True,
+                })
+        return procs
+
+    def _get_container_procs(self, cid: str, debug: list = None) -> list[dict]:
         """Enumerate ALL processes inside a container, returning HOST-namespace PIDs.
 
         Strategy (in order):
-          1. docker top -eo pid,user,args  — host-side ps, works for distroless/Alpine
-          2. docker top (default columns)  — always available on the host
-          3. docker exec ps               — fallback for containers with procps
+          1. /proc namespace walk via container's init PID — most reliable, no container tools
+          2. docker top -eo pid,user,args  — host-side ps, works for distroless/Alpine
+          3. docker top (default columns)  — always available on the host
+          4. docker exec ps               — fallback for containers with procps
+
+        debug: optional list to append diagnostic messages to
         """
-        # Attempt 1 — docker top with explicit columns (gives HOST PIDs, no container tools needed)
+        def dbg(msg):
+            if debug is not None:
+                debug.append(msg)
+
+        # --- Strategy 1: /proc namespace walk (most reliable) ---
+        init_pid = self._docker(
+            f"inspect {cid} --format '{{{{.State.Pid}}}}' 2>/dev/null"
+        ).strip()
+        dbg(f"    [diag] container init PID from inspect: {repr(init_pid)}")
+
+        if init_pid and init_pid.isdigit() and init_pid != "0":
+            procs = self._get_ns_procs(init_pid)
+            dbg(f"    [diag] /proc ns-walk returned {len(procs)} procs")
+            if procs:
+                return procs
+
+        # --- Strategy 2: docker top with explicit columns ---
         top_out = self._docker(f"top {cid} -eo pid,user,args 2>/dev/null")
+        dbg(f"    [diag] docker top -eo output: {repr(top_out[:200]) if top_out else 'empty'}")
         if top_out and top_out.strip():
             procs = self._parse_top_output(top_out)
+            dbg(f"    [diag] parsed {len(procs)} procs from docker top -eo")
             if procs:
                 return procs
 
-        # Attempt 2 — docker top default format (still gives HOST PIDs)
+        # --- Strategy 3: docker top default format ---
         top_out2 = self._docker(f"top {cid} 2>/dev/null")
+        dbg(f"    [diag] docker top (default) output: {repr(top_out2[:200]) if top_out2 else 'empty'}")
         if top_out2 and top_out2.strip():
             procs = self._parse_top_output(top_out2)
+            dbg(f"    [diag] parsed {len(procs)} procs from docker top default")
             if procs:
                 return procs
 
-        # Attempt 3 — docker exec ps (container must have ps installed; PIDs are container-namespace)
+        # --- Strategy 4: docker exec ps (requires ps inside container) ---
         ps_out = self._docker(
             f"exec {cid} ps -eo pid,user,args --no-headers 2>/dev/null"
         )
+        dbg(f"    [diag] docker exec ps output: {repr(ps_out[:200]) if ps_out else 'empty'}")
         if ps_out and ps_out.strip():
             procs = []
             for line in ps_out.strip().splitlines():
@@ -282,9 +346,11 @@ class RuntimeScanner:
                         "cmdline": p[2].strip() if len(p) > 2 else "",
                         "_host_pid": False,  # container-namespace PID
                     })
+            dbg(f"    [diag] docker exec ps returned {len(procs)} procs")
             if procs:
                 return procs
 
+        dbg("    [diag] ALL strategies failed — no procs found")
         return []
 
     def _discover_docker_services(self, result: ScanResult) -> list[dict]:
@@ -313,10 +379,13 @@ class RuntimeScanner:
 
             result.raw_output += f"\n  Container: {cname} ({image})\n"
 
-            # Enumerate ALL processes (primary: docker top → HOST PIDs, no container tools needed)
-            procs = self._get_container_procs(cid)
+            # Enumerate ALL processes (primary: /proc ns-walk → HOST PIDs)
+            diag: list = []
+            procs = self._get_container_procs(cid, debug=diag)
+            for d in diag:
+                result.raw_output += d + "\n"
             if not procs:
-                result.raw_output += "    (could not enumerate processes — docker top and exec both failed)\n"
+                result.raw_output += "    (could not enumerate processes — all strategies failed)\n"
                 continue
 
             result.raw_output += f"    Found {len(procs)} process(es)\n"
@@ -842,8 +911,8 @@ class RuntimeScanner:
                 f"inspect {cid} --format '{{{{.Name}}}}' 2>/dev/null"
             ).strip().lstrip("/")
 
-            # Get processes — prefer docker top (HOST PIDs, no container tools needed)
-            procs = self._get_container_procs(cid)
+            # Get processes — prefer /proc ns-walk (HOST PIDs, no container tools needed)
+            procs = self._get_container_procs(cid)  # debug already logged in _discover_docker_services
             if not procs:
                 continue
 
