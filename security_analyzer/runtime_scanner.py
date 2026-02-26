@@ -74,12 +74,15 @@ class RuntimeScanner:
         result.raw_output += f"\nTotal services discovered: {len(all_services)}\n\n"
 
         # Per-service language-specific analysis
+        # Use separate seen sets for host vs each container to avoid cross-contamination
         seen_binaries: set = set()
         for svc in all_services:
             runtime = svc.get("runtime", "unknown")
+            # For container services, use the per-container seen set stored in the svc dict
+            seen = svc.pop("_seen_binaries", None) or seen_binaries
             try:
                 if runtime == "c_cpp":
-                    self._check_c_cpp_service(svc, result, seen_binaries)
+                    self._check_c_cpp_service(svc, result, seen)
                 elif runtime in ("java", "kotlin"):
                     self._check_jvm_service(svc, result)
                 elif runtime == "python":
@@ -185,8 +188,55 @@ class RuntimeScanner:
 
         return services
 
+    def _get_container_procs(self, cid: str) -> list[dict]:
+        """Enumerate ALL processes inside a container.
+
+        Tries ps first; falls back to walking /proc directly (works on Alpine,
+        distroless, and any image that lacks ps/procps).
+        """
+        # Attempt 1 — standard ps
+        ps_out = self._docker(
+            f"exec {cid} ps -eo pid,user,args --no-headers 2>/dev/null"
+        )
+        if ps_out and ps_out.strip():
+            procs = []
+            for line in ps_out.strip().splitlines():
+                p = line.split(None, 2)
+                if len(p) >= 2:
+                    procs.append({
+                        "pid": p[0].strip(),
+                        "user": p[1].strip(),
+                        "cmdline": p[2].strip() if len(p) > 2 else "",
+                    })
+            if procs:
+                return procs
+
+        # Attempt 2 — /proc walk (no ps needed, works everywhere)
+        # One-liner: read cmdline for every numeric dir in /proc
+        proc_script = (
+            "for pid in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do "
+            "  cmdline=$(cat /proc/$pid/cmdline 2>/dev/null | tr '\\0' ' ' | sed 's/[[:space:]]*$//'); "
+            "  uid=$(awk '/^Uid:/{print $2}' /proc/$pid/status 2>/dev/null); "
+            "  [ -n \"$cmdline\" ] && echo \"$pid ${uid:-0} $cmdline\"; "
+            "done"
+        )
+        proc_out = self._docker(f"exec {cid} sh -c '{proc_script}' 2>/dev/null")
+        if not proc_out or not proc_out.strip():
+            return []
+
+        procs = []
+        for line in proc_out.strip().splitlines():
+            p = line.split(None, 2)
+            if len(p) >= 2:
+                procs.append({
+                    "pid": p[0].strip(),
+                    "user": p[1].strip(),
+                    "cmdline": p[2].strip() if len(p) > 2 else "",
+                })
+        return procs
+
     def _discover_docker_services(self, result: ScanResult) -> list[dict]:
-        """For each running Docker container enumerate its processes and classify."""
+        """For each running Docker container enumerate ALL processes and classify."""
         cids_out = self._docker("ps -q 2>/dev/null")
         if not cids_out or not cids_out.strip():
             result.raw_output += "  No running Docker containers\n"
@@ -200,43 +250,39 @@ class RuntimeScanner:
 
             # Container name + image
             meta = self._docker(f"inspect {cid} --format '{{{{.Name}}}}|||{{{{.Config.Image}}}}' 2>/dev/null")
-            parts = meta.strip().split("|||") if meta else [cid, ""]
-            cname = parts[0].strip().lstrip("/")
-            image = parts[1].strip() if len(parts) > 1 else ""
+            mparts = meta.strip().split("|||") if meta else [cid, ""]
+            cname = mparts[0].strip().lstrip("/")
+            image = mparts[1].strip() if len(mparts) > 1 else ""
 
             result.raw_output += f"\n  Container: {cname} ({image})\n"
 
-            # Get processes inside the container
-            ps_out = self._docker(f"exec {cid} ps -eo pid,user,args --no-headers 2>/dev/null | head -30")
-            if not ps_out or not ps_out.strip():
-                # fallback: read /proc/1/cmdline of PID 1 in container
-                ps_out = self._docker(
-                    f"exec {cid} sh -c "
-                    f"\"cat /proc/1/cmdline 2>/dev/null | tr '\\0' ' '\" 2>/dev/null"
-                )
-                if ps_out:
-                    ps_out = f"1 root {ps_out.strip()}"
-
-            if not ps_out or not ps_out.strip():
-                result.raw_output += "    (could not enumerate processes)\n"
+            # Enumerate ALL processes inside the container
+            procs = self._get_container_procs(cid)
+            if not procs:
+                result.raw_output += "    (could not enumerate processes — no ps or /proc access)\n"
                 continue
 
-            for line in ps_out.strip().splitlines():
-                parts2 = line.split(None, 2)
-                if len(parts2) < 2:
+            result.raw_output += f"    Found {len(procs)} process(es)\n"
+
+            seen_binaries: set = set()
+            for proc in procs:
+                pid = proc["pid"]
+                user = proc["user"]
+                cmdline = proc["cmdline"]
+
+                if not cmdline or any(s in cmdline for s in ["ps -eo", "grep", "sh -c"]):
                     continue
-                pid = parts2[0]
-                user = parts2[1] if len(parts2) > 1 else "?"
-                cmdline = parts2[2] if len(parts2) > 2 else ""
-                if not cmdline or any(s in cmdline for s in ["ps -eo", "[", "grep"]):
+                # Skip kernel threads (appear as [kworker] etc.)
+                if cmdline.startswith("["):
                     continue
 
-                # resolve binary inside container
+                # Resolve binary path INSIDE the container
                 binary = self._docker(
                     f"exec {cid} sh -c 'readlink -f /proc/{pid}/exe 2>/dev/null'"
                 ).strip()
 
-                runtime = self._classify_runtime(cmdline, binary, pid)
+                # Classify using container-aware logic (runs file/strings inside container)
+                runtime = self._classify_runtime_in_container(cid, cmdline, binary)
 
                 svc = {
                     "pid": pid, "user": user, "cmdline": cmdline,
@@ -244,100 +290,173 @@ class RuntimeScanner:
                     "name": cname,
                     "cid": cid, "image": image,
                     "source": f"docker:{cid[:12]}",
+                    "_seen_binaries": seen_binaries,  # shared dedup set per container
                 }
                 if runtime != "unknown":
                     services.append(svc)
                     result.raw_output += (
-                        f"    PID={pid} runtime={runtime} cmd={cmdline[:80]}\n"
+                        f"    PID={pid} user={user} runtime={runtime} "
+                        f"cmd={cmdline[:70]}\n"
                     )
 
         return services
 
     # ---------------------------------------------------------- runtime classifier
 
-    def _classify_runtime(self, cmdline: str, binary: str, pid: str) -> str:
+    def _classify_by_cmdline(self, cmdline: str) -> str:
+        """Fast cmdline-only classification — no remote calls needed."""
         cl = cmdline.lower()
-        bn = (binary or "").lower()
+        # strip full paths to just look at the base command name too
+        base = cl.split()[0].rsplit("/", 1)[-1] if cl.split() else ""
 
-        # JVM
-        if "java" in cl.split() or "/java " in cl or cl.startswith("java "):
-            if "kotlin" in cl or "ktor" in cl:
-                return "kotlin"
-            # check JAR manifest for Kotlin-Version header
-            return "java"
-
-        # Python
-        if re.search(r'\bpython[23]?\b', cl):
+        if re.search(r'\bjava\b', cl) or ".jar" in cl or "kotlinc" in cl:
+            return "kotlin" if ("kotlin" in cl or "ktor" in cl) else "java"
+        if re.search(r'\bpython[23]?\b', cl) or base in ("python", "python2", "python3"):
             return "python"
-
-        # Node.js
-        if re.search(r'\b(node|nodejs|ts-node)\b', cl):
+        if re.search(r'\b(node|nodejs|ts-node)\b', cl) or base in ("node", "nodejs"):
             return "nodejs"
-
-        # Ruby
-        if re.search(r'\bruby\b', cl):
+        if re.search(r'\bruby\b', cl) or base == "ruby":
             return "ruby"
-
-        # .NET / Mono
-        if re.search(r'\b(dotnet|mono)\b', cl):
+        if re.search(r'\b(dotnet|mono)\b', cl) or base in ("dotnet", "mono"):
             return "dotnet"
-
-        # PHP
-        if re.search(r'\bphp\b', cl):
+        if re.search(r'\bphp\b', cl) or base in ("php", "php-fpm"):
             return "php"
+        return ""  # empty = need ELF analysis
 
-        # Go and C/C++ are native binaries — need ELF analysis
+    def _classify_runtime(self, cmdline: str, binary: str, pid: str) -> str:
+        """Classify a HOST-side process. ELF checks run on the host."""
+        rt = self._classify_by_cmdline(cmdline)
+        if rt:
+            return rt
+
+        # Native binary: run ELF checks on host
         if binary and binary not in ("/usr/sbin/sshd", "/usr/bin/sshd", "/sbin/init"):
-            file_info = self._run_remote(f"file {binary} 2>/dev/null")
-            if file_info and "ELF" in file_info:
-                # Check for Go build ID
-                go_check = self._run_remote(
-                    f"strings {binary} 2>/dev/null | grep -m1 'go1\\.' 2>/dev/null"
-                )
-                if go_check and go_check.strip():
-                    return "go"
-                # Check for Rust runtime
-                rust_check = self._run_remote(
-                    f"nm -D {binary} 2>/dev/null | grep -m1 'rust_panic\\|__rust_' 2>/dev/null"
-                )
-                if rust_check and rust_check.strip():
-                    return "rust"
-                # Check for C++ symbols
-                cpp_check = self._run_remote(
-                    f"nm -D {binary} 2>/dev/null | grep -m1 '_ZN\\|_ZSt' 2>/dev/null"
-                )
-                if cpp_check and cpp_check.strip():
-                    return "c_cpp"
-                # Plain C ELF
-                return "c_cpp"
+            return self._elf_classify_host(binary)
 
         return "unknown"
 
+    def _classify_runtime_in_container(self, cid: str, cmdline: str, binary: str) -> str:
+        """Classify a process running INSIDE a Docker container.
+
+        All ELF analysis commands are sent via `docker exec` so they run
+        against the container's filesystem — not the host's.
+        """
+        rt = self._classify_by_cmdline(cmdline)
+        if rt:
+            return rt
+
+        if not binary:
+            return "unknown"
+
+        # Run file/strings/nm INSIDE the container
+        file_info = self._docker(f"exec {cid} file {binary} 2>/dev/null")
+        if not file_info or "ELF" not in file_info:
+            return "unknown"
+
+        # Go: build ID embedded in binary
+        go_check = self._docker(
+            f"exec {cid} sh -c 'strings {binary} 2>/dev/null | grep -m1 go1\\.' 2>/dev/null"
+        )
+        if go_check and go_check.strip():
+            return "go"
+
+        # Rust: runtime symbols
+        rust_check = self._docker(
+            f"exec {cid} sh -c "
+            f"'nm -D {binary} 2>/dev/null | grep -m1 rust_panic 2>/dev/null'"
+        )
+        if rust_check and rust_check.strip():
+            return "rust"
+
+        # C++ mangled symbols
+        cpp_check = self._docker(
+            f"exec {cid} sh -c "
+            f"'nm -D {binary} 2>/dev/null | grep -m1 _ZN 2>/dev/null'"
+        )
+        if cpp_check and cpp_check.strip():
+            return "c_cpp"
+
+        return "c_cpp"  # plain C ELF
+
+    def _elf_classify_host(self, binary: str) -> str:
+        """Classify a native binary on the HOST via file/strings/nm."""
+        file_info = self._run_remote(f"file {binary} 2>/dev/null")
+        if not file_info or "ELF" not in file_info:
+            return "unknown"
+        go_check = self._run_remote(
+            f"strings {binary} 2>/dev/null | grep -m1 'go1\\.' 2>/dev/null"
+        )
+        if go_check and go_check.strip():
+            return "go"
+        rust_check = self._run_remote(
+            f"nm -D {binary} 2>/dev/null | grep -m1 'rust_panic' 2>/dev/null"
+        )
+        if rust_check and rust_check.strip():
+            return "rust"
+        cpp_check = self._run_remote(
+            f"nm -D {binary} 2>/dev/null | grep -m1 '_ZN' 2>/dev/null"
+        )
+        if cpp_check and cpp_check.strip():
+            return "c_cpp"
+        return "c_cpp"
+
     # ---------------------------------------------------------- C / C++ checks
+
+    def _run_for_svc(self, svc: dict, cmd_on_binary: str) -> str:
+        """Run a command on the binary, routing via docker exec for container services."""
+        cid = svc.get("cid")
+        binary = svc.get("binary", "")
+        if not binary:
+            return ""
+        if cid:
+            return self._docker(f"exec {cid} sh -c '{cmd_on_binary}' 2>/dev/null")
+        return self._run_remote(f"{cmd_on_binary} 2>/dev/null")
 
     def _check_c_cpp_service(self, svc: dict, result: ScanResult, seen: set):
         binary = svc.get("binary", "")
         name = svc.get("name", binary)
         source = svc.get("source", "host")
-        if not binary or binary in seen:
+        cid = svc.get("cid")
+
+        # Deduplicate per binary path (per container if applicable)
+        dedup_key = f"{cid or 'host'}:{binary}"
+        if not binary or dedup_key in seen:
             return
-        seen.add(binary)
+        seen.add(dedup_key)
 
         result.raw_output += f"\n--- C/C++ Service: {name} ({binary}) [{source}] ---\n"
 
-        # 1. Dangerous function usage
-        self._check_dangerous_functions(binary, name, result)
+        # 1. Dangerous function usage — run nm inside container or on host
+        nm_out = self._run_for_svc(svc, f"nm -D {binary} 2>/dev/null | grep -iE ' U ' | head -100")
+        if nm_out:
+            found = [f for f in DANGEROUS_C_FUNCS if re.search(rf'\bU\b.*\b{re.escape(f)}\b', nm_out)]
+            if found:
+                critical = bool(set(found) & {"gets", "sprintf", "vsprintf", "system", "popen"})
+                result.add_finding(Finding(
+                    title=f"Dangerous C Functions Detected: {name} — {', '.join(found[:5])}",
+                    severity=Severity.CRITICAL if critical else Severity.HIGH,
+                    category=Category.BINARY_SECURITY,
+                    description=(
+                        f"Binary '{name}' imports unsafe C library function(s): {', '.join(found)}. "
+                        "These lack bounds checking and are the root cause of most memory corruption CVEs."
+                    ),
+                    evidence=f"nm -D {binary}: {found}",
+                    recommendation=(
+                        "Replace: gets()→fgets(), strcpy()→strlcpy(), sprintf()→snprintf(), "
+                        "system()→execve(). Compile with -D_FORTIFY_SOURCE=2 -fstack-protector-strong."
+                    ),
+                    cwe_id="CWE-120",
+                    cvss_score=9.0 if critical else 7.5,
+                ))
 
-        # 2. Format string vulnerability indicator
-        self._check_format_string_risk(binary, name, result)
+        # 2. Format string risk
+        self._check_format_string_risk_svc(svc, name, result)
 
-        # 3. ELF hardening recap (PIE, canary, RELRO, NX, FORTIFY)
-        self._check_elf_hardening(binary, name, result)
+        # 3. ELF hardening — run readelf inside container or on host
+        self._check_elf_hardening_svc(svc, name, result)
 
         # 4. RPATH hijacking
-        rpath = self._run_remote(
-            f"readelf -d {binary} 2>/dev/null | grep -iE 'rpath|runpath'"
-        )
+        rpath = self._run_for_svc(svc, f"readelf -d {binary} 2>/dev/null | grep -iE 'rpath|runpath'")
         if rpath and rpath.strip():
             writable = any(p in rpath for p in ["$ORIGIN", ".", "/tmp", "/home"])
             result.add_finding(Finding(
@@ -346,17 +465,17 @@ class RuntimeScanner:
                 category=Category.BINARY_SECURITY,
                 description=(
                     f"Binary '{name}' has RPATH/RUNPATH set. "
-                    "Attacker-controlled paths enable library injection (DLL hijacking equivalent)."
+                    "Attacker-controlled paths enable library injection."
                 ),
                 evidence=rpath.strip()[:200],
-                recommendation="Remove RPATH with `chrpath -d <binary>`. "
-                               "Use system library paths instead.",
+                recommendation="Remove RPATH with `chrpath -d <binary>`.",
                 cwe_id="CWE-426",
                 cvss_score=7.5 if writable else 5.3,
             ))
 
-        # 5. Linked libraries for known-vulnerable versions
-        self._check_linked_libraries(binary, name, result)
+        # 5. Linked libraries for known-vulnerable versions (host only — needs ssl/xml tools)
+        if not cid:
+            self._check_linked_libraries(binary, name, result)
 
         # 6. Running as root?
         if svc.get("user") in ("root", "0"):
@@ -366,16 +485,88 @@ class RuntimeScanner:
                 category=Category.BINARY_SECURITY,
                 description=(
                     f"Native binary '{name}' (PID {svc.get('pid')}) is running as root. "
-                    "Any memory corruption vulnerability (buffer overflow, use-after-free) "
-                    "immediately grants root-level code execution."
+                    "Any memory corruption vulnerability immediately grants root-level code execution."
                 ),
-                evidence=f"user=root, binary={binary}",
+                evidence=f"user=root, binary={binary}, source={source}",
                 recommendation=(
-                    "Drop privileges after startup with setuid()/setgid() to a dedicated account. "
-                    "Run the service under a non-privileged user."
+                    "Drop privileges after startup. Run the service under a non-privileged user."
                 ),
                 cwe_id="CWE-250",
                 cvss_score=8.5,
+            ))
+
+    def _check_format_string_risk_svc(self, svc: dict, name: str, result: ScanResult):
+        binary = svc.get("binary", "")
+        if not binary:
+            return
+        nm_out = self._run_for_svc(svc, f"nm -D {binary} 2>/dev/null | grep -E 'U.*printf' | head -20")
+        if not nm_out or not nm_out.strip():
+            return
+        printf_funcs = re.findall(r'\b(\w*printf\w*)\b', nm_out)
+        if not printf_funcs:
+            return
+        fortify = self._run_for_svc(svc, f"nm -D {binary} 2>/dev/null | grep -c '__.*printf.*chk'")
+        if fortify and fortify.strip() not in ("0", ""):
+            return  # FORTIFY active
+        result.add_finding(Finding(
+            title=f"Format String Risk (No FORTIFY): {name}",
+            severity=Severity.HIGH,
+            category=Category.BINARY_SECURITY,
+            description=(
+                f"Binary '{name}' uses printf-family functions ({', '.join(set(printf_funcs[:4]))}) "
+                "without FORTIFY_SOURCE. If any call passes user input as the format string, "
+                "this enables arbitrary memory read/write."
+            ),
+            evidence=f"printf funcs: {set(printf_funcs[:4])}, FORTIFY: no",
+            recommendation="Compile with -D_FORTIFY_SOURCE=2 -Wformat -Werror=format-security.",
+            cwe_id="CWE-134",
+            cvss_score=8.1,
+        ))
+
+    def _check_elf_hardening_svc(self, svc: dict, name: str, result: ScanResult):
+        """ELF hardening checks routed via docker exec or host."""
+        binary = svc.get("binary", "")
+        if not binary:
+            return
+        # PIE
+        pie = self._run_for_svc(svc, f"readelf -h {binary} 2>/dev/null | grep Type")
+        if pie and "EXEC" in pie and "DYN" not in pie:
+            result.add_finding(Finding(
+                title=f"No PIE: {name}",
+                severity=Severity.HIGH,
+                category=Category.BINARY_SECURITY,
+                description=f"Service binary '{name}' is not PIE. ASLR cannot fully protect it.",
+                evidence=pie.strip()[:100],
+                recommendation="Recompile with -fPIE -pie.",
+                cwe_id="CWE-119",
+            ))
+        # Stack canary
+        canary = self._run_for_svc(
+            svc,
+            f"readelf -s {binary} 2>/dev/null | grep -q __stack_chk_fail && echo YES || echo NO"
+        )
+        if canary and "NO" in canary:
+            result.add_finding(Finding(
+                title=f"No Stack Canary: {name}",
+                severity=Severity.HIGH,
+                category=Category.BINARY_SECURITY,
+                description=f"Service binary '{name}' has no stack smashing protection.",
+                evidence="__stack_chk_fail not in symbol table",
+                recommendation="Recompile with -fstack-protector-strong.",
+                cwe_id="CWE-121",
+            ))
+        # Executable stack
+        nx = self._run_for_svc(svc, f"readelf -l {binary} 2>/dev/null | grep GNU_STACK | grep -c RWE")
+        if nx and nx.strip() != "0":
+            result.add_finding(Finding(
+                title=f"Executable Stack: {name}",
+                severity=Severity.CRITICAL,
+                category=Category.BINARY_SECURITY,
+                description=f"Binary '{name}' has an executable stack. Shellcode can run on the stack.",
+                evidence="GNU_STACK RWE",
+                recommendation="Recompile with -z noexecstack.",
+                cwe_id="CWE-119",
+                cvss_score=9.0,
             ))
 
     def _check_dangerous_functions(self, binary: str, name: str, result: ScanResult):
@@ -550,7 +741,7 @@ class RuntimeScanner:
                 ))
 
     def _check_c_cpp_in_docker(self, result: ScanResult):
-        """For every Docker container, find C/C++ native binaries and apply dangerous-function checks."""
+        """For every Docker container, find ALL C/C++ native binaries and deep-scan them."""
         result.raw_output += "\n--- C/C++ Binaries Inside Docker Containers ---\n"
 
         cids_out = self._docker("ps -q 2>/dev/null")
@@ -563,82 +754,115 @@ class RuntimeScanner:
             if not cid:
                 continue
 
-            cname = self._docker(f"inspect {cid} --format '{{{{.Name}}}}' 2>/dev/null").strip().lstrip("/")
+            cname = self._docker(
+                f"inspect {cid} --format '{{{{.Name}}}}' 2>/dev/null"
+            ).strip().lstrip("/")
 
-            # Get PID 1 binary inside container
-            pid1_exe = self._docker(
-                f"exec {cid} sh -c 'readlink -f /proc/1/exe 2>/dev/null'"
-            ).strip()
-
-            if not pid1_exe:
+            # Enumerate ALL processes inside the container
+            procs = self._get_container_procs(cid)
+            if not procs:
                 continue
 
-            # Check if it's a native ELF (C/C++) — not java/python/node
-            file_info = self._docker(f"exec {cid} file {pid1_exe} 2>/dev/null")
-            if not file_info or "ELF" not in file_info:
-                continue
+            seen_in_container: set = set()
+            found_any = False
 
-            # Skip known runtimes
-            go_check = self._docker(
-                f"exec {cid} sh -c 'strings {pid1_exe} 2>/dev/null | grep -m1 go1\\.' 2>/dev/null"
-            )
-            if go_check and go_check.strip():
-                continue  # Go binary — handled separately
+            for proc in procs:
+                pid = proc["pid"]
+                cmdline = proc.get("cmdline", "")
+                if not cmdline or cmdline.startswith("["):
+                    continue
 
-            result.raw_output += f"  Container {cname}: C/C++ binary {pid1_exe}\n"
+                # Resolve binary path inside container
+                binary = self._docker(
+                    f"exec {cid} sh -c 'readlink -f /proc/{pid}/exe 2>/dev/null'"
+                ).strip()
+                if not binary or binary in seen_in_container:
+                    continue
+                seen_in_container.add(binary)
 
-            # Check dangerous functions inside container
-            nm_out = self._docker(
-                f"exec {cid} sh -c 'nm -D {pid1_exe} 2>/dev/null | grep -iE U | head -100'"
-            )
-            if not nm_out:
-                # Try objdump as fallback
-                nm_out = self._docker(
-                    f"exec {cid} sh -c "
-                    f"'objdump -p {pid1_exe} 2>/dev/null | grep NEEDED | head -20'"
+                # Check if it's a native ELF
+                file_info = self._docker(f"exec {cid} file {binary} 2>/dev/null")
+                if not file_info or "ELF" not in file_info:
+                    continue
+
+                # Skip Go, Rust, JVM launcher
+                go_check = self._docker(
+                    f"exec {cid} sh -c 'strings {binary} 2>/dev/null | grep -m1 go1\\.' 2>/dev/null"
                 )
+                if go_check and go_check.strip():
+                    continue
+                if any(k in cmdline.lower() for k in ["java", "python", "node", "ruby"]):
+                    continue
 
-            found_dangerous = []
-            if nm_out:
-                for func in DANGEROUS_C_FUNCS:
-                    if re.search(rf'\bU\b.*\b{re.escape(func)}\b', nm_out):
-                        found_dangerous.append(func)
+                found_any = True
+                result.raw_output += f"  Container {cname}: C/C++ binary {binary} (PID {pid})\n"
 
-            if found_dangerous:
-                critical = bool(set(found_dangerous) & {"gets", "sprintf", "system", "popen"})
-                result.add_finding(Finding(
-                    title=f"Dangerous C Functions in Docker Container: {cname}",
-                    severity=Severity.CRITICAL if critical else Severity.HIGH,
-                    category=Category.CONTAINER,
-                    description=(
-                        f"Container '{cname}' runs a C/C++ service ({pid1_exe}) "
-                        f"that imports unsafe functions: {', '.join(found_dangerous)}. "
-                        "Memory corruption in a containerised C service can enable container escape."
-                    ),
-                    evidence=f"container={cname}, binary={pid1_exe}, funcs={found_dangerous}",
-                    recommendation=(
-                        "Rebuild with safe alternatives and compiler hardening flags. "
-                        "Apply a seccomp profile and enable full RELRO + PIE + stack canary."
-                    ),
-                    cwe_id="CWE-120",
-                    cvss_score=9.0 if critical else 7.5,
-                ))
+                # -- Dangerous function check --
+                nm_out = self._docker(
+                    f"exec {cid} sh -c 'nm -D {binary} 2>/dev/null | grep -iE \" U \" | head -100'"
+                )
+                found_dangerous = []
+                if nm_out:
+                    for func in DANGEROUS_C_FUNCS:
+                        if re.search(rf'\bU\b.*\b{re.escape(func)}\b', nm_out):
+                            found_dangerous.append(func)
 
-            # Check ELF hardening inside container
-            pie = self._docker(f"exec {cid} readelf -h {pid1_exe} 2>/dev/null | grep Type")
-            if pie and "EXEC" in pie and "DYN" not in pie:
-                result.add_finding(Finding(
-                    title=f"Container C/C++ Binary Not PIE: {cname}",
-                    severity=Severity.HIGH,
-                    category=Category.CONTAINER,
-                    description=(
-                        f"C/C++ service '{pid1_exe}' in container '{cname}' is not compiled as PIE. "
-                        "Exploiting memory corruption is easier without ASLR randomisation."
-                    ),
-                    evidence=f"container={cname}, readelf Type: {pie.strip()[:80]}",
-                    recommendation="Rebuild with -fPIE -pie.",
-                    cwe_id="CWE-119",
-                ))
+                if found_dangerous:
+                    critical = bool(set(found_dangerous) & {"gets", "sprintf", "vsprintf", "system", "popen"})
+                    result.add_finding(Finding(
+                        title=f"Dangerous C Functions in Container {cname}: {binary.rsplit('/',1)[-1]}",
+                        severity=Severity.CRITICAL if critical else Severity.HIGH,
+                        category=Category.CONTAINER,
+                        description=(
+                            f"Container '{cname}' has a C/C++ binary ({binary}) "
+                            f"that imports: {', '.join(found_dangerous)}. "
+                            "Memory corruption here can enable container escape."
+                        ),
+                        evidence=f"container={cname}, binary={binary}, funcs={found_dangerous}",
+                        recommendation=(
+                            "Rebuild with safe alternatives. Apply seccomp + full RELRO + PIE + canary."
+                        ),
+                        cwe_id="CWE-120",
+                        cvss_score=9.0 if critical else 7.5,
+                    ))
+
+                # -- PIE check --
+                pie = self._docker(f"exec {cid} readelf -h {binary} 2>/dev/null | grep Type")
+                if pie and "EXEC" in pie and "DYN" not in pie:
+                    result.add_finding(Finding(
+                        title=f"Container C/C++ Binary Not PIE: {cname}/{binary.rsplit('/',1)[-1]}",
+                        severity=Severity.HIGH,
+                        category=Category.CONTAINER,
+                        description=(
+                            f"'{binary}' in container '{cname}' is not PIE. "
+                            "Memory corruption exploits are easier without ASLR."
+                        ),
+                        evidence=f"container={cname}, readelf: {pie.strip()[:80]}",
+                        recommendation="Rebuild with -fPIE -pie.",
+                        cwe_id="CWE-119",
+                    ))
+
+                # -- Stack canary check --
+                canary = self._docker(
+                    f"exec {cid} sh -c "
+                    f"'readelf -s {binary} 2>/dev/null | grep -q __stack_chk_fail && echo YES || echo NO'"
+                )
+                if canary and "NO" in canary:
+                    result.add_finding(Finding(
+                        title=f"No Stack Canary in Container {cname}: {binary.rsplit('/',1)[-1]}",
+                        severity=Severity.HIGH,
+                        category=Category.CONTAINER,
+                        description=(
+                            f"C/C++ binary '{binary}' in container '{cname}' "
+                            "has no stack smashing protection."
+                        ),
+                        evidence="__stack_chk_fail not in symbol table",
+                        recommendation="Rebuild with -fstack-protector-strong.",
+                        cwe_id="CWE-121",
+                    ))
+
+            if not found_any:
+                result.raw_output += f"  Container {cname}: no C/C++ ELF binaries found\n"
 
     # ---------------------------------------------------------- JVM / Kotlin checks
 
