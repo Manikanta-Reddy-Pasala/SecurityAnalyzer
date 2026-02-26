@@ -55,7 +55,7 @@ class ServiceScanner:
         cmd.extend([f"{self.user}@{self.host}", command])
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            return proc.stdout if proc.returncode == 0 else proc.stderr
+            return proc.stdout  # always return stdout; callers check for empty string
         except subprocess.TimeoutExpired:
             return None
 

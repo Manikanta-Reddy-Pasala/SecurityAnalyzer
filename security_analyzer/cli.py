@@ -15,6 +15,7 @@ from .database_scanner import DatabaseScanner
 from .java_scanner import JavaScanner
 from .secrets_scanner import SecretsScanner
 from .container_scanner import ContainerScanner
+from .runtime_scanner import RuntimeScanner
 from .report_generator import ReportGenerator
 from .models import ScanResult
 
@@ -32,7 +33,7 @@ def run_scan(host: str, user: str = "ec2-user",
              config_path: str = None) -> list[ScanResult]:
     results = []
 
-    print(f"[*] Security Analyzer v2.1.0")
+    print(f"[*] Security Analyzer v2.2.0")
     print(f"[*] Target: {host}")
     print(f"[*] Output: {output_dir}")
     print()
@@ -40,18 +41,19 @@ def run_scan(host: str, user: str = "ec2-user",
     os.makedirs(output_dir, exist_ok=True)
 
     scanners = [
-        ("1/12",  "Network Scanner",              lambda: NetworkScanner(host).scan()),
-        ("2/12",  "SSH Auditor",                  lambda: SSHAuditor(host, user, key_path).audit()),
-        ("3/12",  "Service Scanner",              lambda: ServiceScanner(host, user, key_path).scan()),
-        ("4/12",  "Infrastructure Auditor",       lambda: InfraAuditor(host, user, key_path).audit()),
-        ("5/12",  "VPN Scanner",                  lambda: VPNScanner(host, user, key_path).scan()),
-        ("6/12",  "Auth Analyzer",                lambda: AuthAnalyzer(host, user, key_path).scan()),
-        ("7/12",  "Payload Exposure Scanner",     lambda: PayloadScanner(host, user, key_path).scan()),
-        ("8/12",  "Binary Vulnerability Scanner", lambda: BinaryScanner(host, user, key_path).scan()),
-        ("9/12",  "Database Scanner",             lambda: DatabaseScanner(host, user, key_path).scan()),
-        ("10/12", "Java/JVM Scanner",             lambda: JavaScanner(host, user, key_path).scan()),
-        ("11/12", "Secrets & Credentials Scanner",lambda: SecretsScanner(host, user, key_path).scan()),
-        ("12/12", "Container Security Scanner",   lambda: ContainerScanner(host, user, key_path).scan()),
+        ("1/13",  "Network Scanner",              lambda: NetworkScanner(host).scan()),
+        ("2/13",  "SSH Auditor",                  lambda: SSHAuditor(host, user, key_path).audit()),
+        ("3/13",  "Service Scanner",              lambda: ServiceScanner(host, user, key_path).scan()),
+        ("4/13",  "Infrastructure Auditor",       lambda: InfraAuditor(host, user, key_path).audit()),
+        ("5/13",  "VPN Scanner",                  lambda: VPNScanner(host, user, key_path).scan()),
+        ("6/13",  "Auth Analyzer",                lambda: AuthAnalyzer(host, user, key_path).scan()),
+        ("7/13",  "Payload Exposure Scanner",     lambda: PayloadScanner(host, user, key_path).scan()),
+        ("8/13",  "Binary Vulnerability Scanner", lambda: BinaryScanner(host, user, key_path).scan()),
+        ("9/13",  "Database Scanner",             lambda: DatabaseScanner(host, user, key_path).scan()),
+        ("10/13", "Java/JVM Scanner",             lambda: JavaScanner(host, user, key_path).scan()),
+        ("11/13", "Secrets & Credentials Scanner",lambda: SecretsScanner(host, user, key_path).scan()),
+        ("12/13", "Container Security Scanner",   lambda: ContainerScanner(host, user, key_path).scan()),
+        ("13/13", "Runtime Language Scanner",     lambda: RuntimeScanner(host, user, key_path).scan()),
     ]
 
     for step, name, scan_fn in scanners:
