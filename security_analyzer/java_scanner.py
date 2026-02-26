@@ -55,7 +55,10 @@ class JavaScanner:
         cmd.extend([f"{self.user}@{self.host}", command])
         try:
             proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            return proc.stdout if proc.returncode == 0 else proc.stderr
+            # Always return stdout — many valid commands (grep, find, pipeline with head)
+            # exit non-zero but still write useful output to stdout.
+            # Callers check for empty/None to detect "nothing found".
+            return proc.stdout
         except subprocess.TimeoutExpired:
             return None
 
@@ -149,31 +152,58 @@ class JavaScanner:
     # ----------------------------------------------------- JVM process detection
 
     def _check_jvm_processes(self, result: ScanResult) -> list[dict]:
-        """Enumerate all running Java processes and parse their JVM arguments."""
+        """Enumerate all running Java processes (host + inside Docker containers)."""
         result.raw_output += "--- JVM Processes ---\n"
-
-        ps_out = self._run_remote(
-            "ps -eo pid,user,args 2>/dev/null | grep -E '[j]ava ' | head -20"
-        )
-        if not ps_out or not ps_out.strip():
-            result.raw_output += "No Java processes detected\n"
-            return []
-
-        result.raw_output += ps_out + "\n"
         procs = []
 
-        for line in ps_out.strip().splitlines():
-            parts = line.split(None, 2)
-            if len(parts) < 3:
-                continue
-            pid, proc_user, cmdline = parts[0], parts[1], parts[2]
-            procs.append({"pid": pid, "user": proc_user, "cmdline": cmdline})
+        # 1. Host-level processes (also shows processes inside containers from host PoV)
+        ps_out = self._run_remote(
+            "ps -eo pid,user,args 2>/dev/null | grep '[j]ava' | grep -v grep | head -20"
+        )
+        if ps_out and ps_out.strip():
+            result.raw_output += f"Host ps output:\n{ps_out}\n"
+            for line in ps_out.strip().splitlines():
+                parts = line.split(None, 2)
+                if len(parts) < 3:
+                    continue
+                pid, proc_user, cmdline = parts[0], parts[1], parts[2]
+                procs.append({"pid": pid, "user": proc_user, "cmdline": cmdline, "source": "host"})
+                jar_match = re.search(r'(-jar\s+\S+\.jar|-cp\s+\S+)', cmdline)
+                main_class = jar_match.group(0) if jar_match else cmdline[:80]
+                result.raw_output += f"  PID {pid} [{proc_user}]: {main_class}\n"
+        else:
+            result.raw_output += "  No Java processes on host (will check inside containers)\n"
 
-            # Report what's running
-            # Find main class or jar name
-            jar_match = re.search(r'(-jar\s+\S+\.jar|-cp\s+\S+)', cmdline)
-            main_class = jar_match.group(0) if jar_match else "(inline class)"
-            result.raw_output += f"  PID {pid} [{proc_user}]: {main_class}\n"
+        # 2. Check INSIDE each running Docker container — catches Java hidden by entrypoint scripts
+        container_ids = self._run_remote("docker ps -q 2>/dev/null")
+        if container_ids and container_ids.strip():
+            for cid in container_ids.strip().splitlines():
+                cid = cid.strip()
+                if not cid:
+                    continue
+                inner_ps = self._run_remote(
+                    f"docker exec {cid} ps -eo pid,user,args 2>/dev/null "
+                    f"| grep '[j]ava' | grep -v grep | head -10"
+                )
+                if not inner_ps or not inner_ps.strip():
+                    # Fallback: try /proc inside container
+                    inner_ps = self._run_remote(
+                        f"docker exec {cid} sh -c "
+                        f"\"cat /proc/*/cmdline 2>/dev/null | tr '\\0' ' ' | grep -i java | head -5\""
+                    )
+                if inner_ps and inner_ps.strip():
+                    result.raw_output += f"  Container {cid}: Java processes found\n{inner_ps[:300]}\n"
+                    for line in inner_ps.strip().splitlines():
+                        parts = line.split(None, 2)
+                        if len(parts) >= 3 and ("java" in parts[2].lower() or "java" in line.lower()):
+                            procs.append({
+                                "pid": parts[0], "user": parts[1],
+                                "cmdline": parts[2] if len(parts) > 2 else line,
+                                "source": f"docker:{cid[:12]}"
+                            })
+
+        if not procs:
+            result.raw_output += "No Java processes detected (host or containers)\n"
 
         return procs
 
@@ -728,8 +758,9 @@ class JavaScanner:
         """Find Docker containers running Java apps and check their JVM args for issues."""
         result.raw_output += "\n--- Docker Java Containers ---\n"
 
+        # Get all running containers with ID, name, image, ports
         containers = self._run_remote(
-            "docker ps --format '{{.Names}}\\t{{.Image}}\\t{{.Ports}}' 2>/dev/null"
+            "docker ps --format '{{.ID}}\\t{{.Names}}\\t{{.Image}}\\t{{.Ports}}' 2>/dev/null"
         )
         if not containers or not containers.strip():
             result.raw_output += "No Docker containers found\n"
@@ -741,23 +772,36 @@ class JavaScanner:
 
         for line in containers.strip().splitlines():
             parts = line.split("\t")
-            if len(parts) < 2:
+            if len(parts) < 3:
                 continue
-            name, image = parts[0], parts[1]
-            ports = parts[2] if len(parts) > 2 else ""
+            cid, name, image = parts[0].strip(), parts[1].strip(), parts[2].strip()
+            ports = parts[3].strip() if len(parts) > 3 else ""
 
-            if not any(kw in image.lower() for kw in java_images):
-                # Also check CMD/Entrypoint for java keyword
-                cmd_check = self._run_remote(
-                    f"docker inspect {name} 2>/dev/null | "
-                    "python3 -c \""
-                    "import sys,json; c=json.load(sys.stdin)[0]; "
-                    "cfg=c.get('Config',{}); "
-                    "print(' '.join((cfg.get('Cmd') or []) + (cfg.get('Entrypoint') or [])))"
-                    "\" 2>/dev/null"
+            # Primary check: actually look for java processes RUNNING INSIDE the container.
+            # This works regardless of image name or entrypoint wrapper scripts.
+            java_procs_in_container = self._run_remote(
+                f"docker exec {cid} ps -eo pid,user,args 2>/dev/null | grep '[j]ava' | head -10"
+            )
+            if not java_procs_in_container or not java_procs_in_container.strip():
+                # Fallback: check image name keywords
+                if not any(kw in image.lower() for kw in java_images):
+                    # Also check CMD/Entrypoint for java keyword
+                    cmd_check = self._run_remote(
+                        f"docker inspect {cid} 2>/dev/null | "
+                        "python3 -c \""
+                        "import sys,json; c=json.load(sys.stdin)[0]; "
+                        "cfg=c.get('Config',{}); "
+                        "print(' '.join((cfg.get('Cmd') or []) + (cfg.get('Entrypoint') or [])))"
+                        "\" 2>/dev/null"
+                    )
+                    if not cmd_check or "java" not in cmd_check.lower():
+                        continue
+                result.raw_output += f"Java container (by image name): {name} ({image})\n"
+            else:
+                result.raw_output += (
+                    f"Java container (live procs): {name} ({image})\n"
+                    f"  Processes: {java_procs_in_container.strip()[:200]}\n"
                 )
-                if not cmd_check or "java" not in cmd_check.lower():
-                    continue
 
             result.raw_output += f"Java container: {name} ({image}) ports: {ports}\n"
 

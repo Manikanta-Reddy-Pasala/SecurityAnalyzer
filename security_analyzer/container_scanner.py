@@ -31,14 +31,29 @@ class ContainerScanner:
         self.host = host
         self.user = user
         self.key_path = key_path
+        self._docker_prefix = "docker"  # may be overridden to "sudo docker" by _probe_docker()
 
     # ------------------------------------------------------------------ public
+
+    def _probe_docker(self) -> tuple[bool, str]:
+        """Check if docker is accessible; try sudo as fallback.
+        Returns (available, container_id_list_or_empty)."""
+        stdout, _, rc = self._run_ssh("docker ps -q 2>/dev/null")
+        if rc == 0 and stdout is not None:
+            self._docker_prefix = "docker"
+            return True, stdout or ""
+        # Try sudo (passwordless sudo or NOPASSWD configured)
+        stdout, _, rc = self._run_ssh("sudo -n docker ps -q 2>/dev/null")
+        if rc == 0 and stdout is not None:
+            self._docker_prefix = "sudo docker"
+            return True, stdout or ""
+        return False, ""
 
     def scan(self) -> ScanResult:
         result = ScanResult(scanner_name="Container Scanner")
 
-        stdout, _, rc = self._run_ssh("docker ps -q 2>/dev/null")
-        if rc != 0 or stdout is None:
+        docker_ok, cid_list = self._probe_docker()
+        if not docker_ok:
             result.add_finding(Finding(
                 title="Docker Not Running - Container Scanner Skipped",
                 severity=Severity.INFO,
@@ -50,9 +65,9 @@ class ContainerScanner:
             ))
             return result
 
-        result.raw_output += f"Docker available. Running container IDs:\n{stdout.strip()}\n\n"
+        result.raw_output += f"Docker available ({self._docker_prefix}). Running container IDs:\n{cid_list.strip()}\n\n"
 
-        container_ids = stdout.strip().splitlines()
+        container_ids = cid_list.strip().splitlines()
         if not container_ids or not any(cid.strip() for cid in container_ids):
             result.add_finding(Finding(
                 title="No Running Containers Found",
@@ -114,10 +129,12 @@ class ContainerScanner:
 
     def _inspect_all(self, format_str: str) -> Optional[str]:
         """Run docker inspect against all running containers with the given Go template."""
+        dp = self._docker_prefix
         stdout, _, rc = self._run_ssh(
-            f"docker inspect $(docker ps -q) --format '{format_str}' 2>/dev/null"
+            f"{dp} inspect $({dp} ps -q) --format '{format_str}' 2>/dev/null"
         )
-        return stdout if rc == 0 and stdout and stdout.strip() else None
+        # Accept any output — rc may be non-zero when some containers fail inspection
+        return stdout if stdout and stdout.strip() else None
 
     # -------------------------------------------------------- check methods
 
@@ -645,8 +662,9 @@ class ContainerScanner:
             return
 
         # Get image names for running containers
+        dp = self._docker_prefix
         images_out, _, _ = self._run_ssh(
-            "docker inspect $(docker ps -q) --format '{{.Config.Image}}' 2>/dev/null"
+            f"{dp} inspect $({dp} ps -q) --format '{{{{.Config.Image}}}}' 2>/dev/null"
         )
         if not images_out or not images_out.strip():
             return
@@ -722,8 +740,9 @@ class ContainerScanner:
     def _check_container_network_exposure(self, result: ScanResult) -> None:
         result.raw_output += "\n--- Container Network Port Exposure ---\n"
 
+        dp = self._docker_prefix
         stdout, _, rc = self._run_ssh(
-            "docker ps --format '{{.Names}}|||{{.Ports}}' 2>/dev/null"
+            f"{dp} ps --format '{{{{.Names}}}}|||{{{{.Ports}}}}' 2>/dev/null"
         )
         if not stdout or not stdout.strip():
             result.raw_output += "No docker ps output for network exposure check.\n"
