@@ -18,14 +18,14 @@ Audits network, SSH, services, infrastructure, VPN, authentication, payload expo
 
 ```bash
 # Full scan (needs SSH access)
-python -m security_analyzer --host <IP> --user ec2-user --key /path/to/key.pem
+python -m security_analyzer --host <IP> --user <user> --key /path/to/key.pem
 
 # Network-only scan (no SSH needed)
 python -m security_analyzer --host <IP> --network-only
 
 # Using config file
 export SCAN_HOST=<IP>
-export SCAN_SSH_USER=ec2-user
+export SCAN_SSH_USER=<user>
 export SCAN_SSH_KEY_PATH=/path/to/key.pem
 python -m security_analyzer --config configs/sample_config.yaml
 
