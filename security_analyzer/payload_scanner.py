@@ -89,16 +89,94 @@ class PayloadScanner:
             return 0, ""
 
     def _discover_http_ports(self) -> list[int]:
-        ports = []
-        for port in [80, 443, 3000, 5000, 8080, 8081, 8090, 9090]:
+        """Discover all HTTP-capable ports: pull every listening port via ss, then HTTP-probe each."""
+        # Start with a broad hardcoded baseline
+        candidates = {
+            80, 443, 3000, 3001, 4000, 4200, 5000, 5001, 7000, 8000,
+            8080, 8081, 8082, 8090, 8443, 8888, 9000, 9090, 9200, 9300,
+        }
+
+        # Add every TCP port that ss reports as LISTEN on the target host
+        if self.user and self._can_connect():
+            ss_out = self._run_remote(
+                "ss -tlnp 2>/dev/null | awk 'NR>1 {print $4}' "
+                "| grep -oE '[0-9]+$' | sort -un"
+            )
+            if ss_out:
+                for line in ss_out.strip().splitlines():
+                    try:
+                        candidates.add(int(line.strip()))
+                    except ValueError:
+                        pass
+
+        # Probe each candidate — keep only those that respond to HTTP
+        http_ports = []
+        for port in sorted(candidates):
             try:
                 with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                    s.settimeout(3)
-                    if s.connect_ex((self.host, port)) == 0:
-                        ports.append(port)
+                    s.settimeout(2)
+                    if s.connect_ex((self.host, port)) != 0:
+                        continue
+                # Quick HTTP GET to confirm it speaks HTTP
+                status, _ = self._http_get(port, "/")
+                if status > 0:
+                    http_ports.append(port)
             except (socket.timeout, OSError):
                 pass
-        return ports
+        return http_ports
+
+    def _discover_app_dirs(self) -> list[str]:
+        """Discover directories where applications are actually running (from process cmdlines)."""
+        base_dirs = {"/opt", "/srv", "/app", "/var/www", "/home", "/usr/local",
+                     "/var/lib", "/usr/share", "/data", "/apps", "/services"}
+
+        if not (self.user and self._can_connect()):
+            return sorted(base_dirs)
+
+        # Get working dirs of all non-system processes
+        cwd_out = self._run_remote(
+            "for pid in $(ls /proc | grep -E '^[0-9]+$'); do "
+            "  exe=$(readlink /proc/$pid/exe 2>/dev/null); "
+            "  cwd=$(readlink /proc/$pid/cwd 2>/dev/null); "
+            "  [[ -n \"$cwd\" && \"$cwd\" != / && \"$cwd\" != /usr* && \"$cwd\" != /bin* ]] "
+            "    && echo $cwd; "
+            "done 2>/dev/null | sort -u | head -30"
+        )
+        if cwd_out:
+            for line in cwd_out.strip().splitlines():
+                d = line.strip()
+                if d and len(d) > 1:
+                    base_dirs.add(d)
+
+        # Also pull -jar / -cp dirs from java processes
+        java_dirs = self._run_remote(
+            "ps -eo args 2>/dev/null | grep '[j]ava ' | "
+            "grep -oE '\\-jar [^ ]+\\.jar' | awk '{print $2}' | "
+            "xargs -I{} dirname {} 2>/dev/null | sort -u | head -10"
+        )
+        if java_dirs:
+            for line in java_dirs.strip().splitlines():
+                d = line.strip()
+                if d:
+                    base_dirs.add(d)
+
+        # Docker container mounts
+        mounts = self._run_remote(
+            "docker inspect $(docker ps -q) 2>/dev/null | "
+            "python3 -c \""
+            "import sys,json; "
+            "[print(m['Source']) for c in json.load(sys.stdin) "
+            " for m in c.get('Mounts',[]) "
+            " if m.get('Type')=='bind' and m.get('Source','').startswith('/')]"
+            "\" 2>/dev/null | sort -u | head -15"
+        )
+        if mounts:
+            for line in mounts.strip().splitlines():
+                d = line.strip()
+                if d and not d.startswith('/sys') and not d.startswith('/proc'):
+                    base_dirs.add(d)
+
+        return sorted(base_dirs)
 
     def _check_debug_endpoints(self, port: int, result: ScanResult):
         """Check for exposed debug and profiling endpoints."""
@@ -412,8 +490,10 @@ class PayloadScanner:
 
     def _check_debug_symbols(self, result: ScanResult):
         """Check if binaries have debug symbols (information leak risk)."""
+        # Build search path dynamically from where apps actually live
+        app_dirs = " ".join(self._discover_app_dirs()[:10])
         binaries = self._run_remote(
-            "find /opt /srv /app /usr/local/bin -type f -executable 2>/dev/null | head -20"
+            f"find {app_dirs} -type f -executable 2>/dev/null | head -20"
         )
         if binaries:
             for binary in binaries.strip().split("\n")[:5]:
@@ -455,9 +535,15 @@ class PayloadScanner:
 
     def _check_log_sensitive_data(self, result: ScanResult):
         """Check if logs contain sensitive data."""
+        # Discover log dirs: system + app-specific
+        app_dirs = self._discover_app_dirs()
+        log_dirs = ["/var/log"]
+        for d in app_dirs:
+            log_dirs += [f"{d}/logs", f"{d}/log"]
+        log_search_path = " ".join(log_dirs[:12])
         log_check = self._run_remote(
-            "grep -rilE '(password|secret|token|api_key|bearer)' "
-            "/var/log/ --include='*.log' 2>/dev/null | head -10"
+            f"grep -rilE '(password|secret|token|api_key|bearer)' "
+            f"{log_search_path} --include='*.log' 2>/dev/null | head -10"
         )
         if log_check and log_check.strip():
             result.add_finding(Finding(

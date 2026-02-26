@@ -68,6 +68,69 @@ class JavaScanner:
         except (socket.timeout, ConnectionRefusedError, OSError):
             return False
 
+    def _discover_listening_ports(self) -> list[int]:
+        """Pull every TCP port currently in LISTEN state from the target via ss."""
+        ports = []
+        if not self._can_connect():
+            return ports
+        out = self._run_remote(
+            "ss -tlnp 2>/dev/null | awk 'NR>1 {print $4}' "
+            "| grep -oE '[0-9]+$' | sort -un"
+        )
+        if out:
+            for line in out.strip().splitlines():
+                try:
+                    ports.append(int(line.strip()))
+                except ValueError:
+                    pass
+        return ports
+
+    def _discover_java_app_dirs(self, java_procs: list[dict]) -> list[str]:
+        """Collect app dirs from running Java process -jar/-cp args, cwd, and Docker mounts."""
+        dirs = {"/opt", "/srv", "/app", "/var/www", "/home", "/var/lib",
+                "/usr/share", "/data", "/apps", "/services"}
+
+        for proc in java_procs:
+            cmdline = proc.get("cmdline", "")
+
+            # -jar /path/to/app.jar  →  /path/to
+            jar_match = re.search(r'-jar\s+(\S+\.jar)', cmdline)
+            if jar_match:
+                jar_path = jar_match.group(1)
+                dirs.add(jar_path.rsplit("/", 1)[0] if "/" in jar_path else ".")
+
+            # -cp / -classpath entries (colon-separated)
+            cp_match = re.search(r'(?:-cp|-classpath)\s+(\S+)', cmdline)
+            if cp_match:
+                for entry in cp_match.group(1).split(":"):
+                    if "/" in entry:
+                        dirs.add(entry.rsplit("/", 1)[0])
+
+            # Process working directory
+            pid = proc.get("pid")
+            if pid:
+                cwd = self._run_remote(f"readlink /proc/{pid}/cwd 2>/dev/null")
+                if cwd and cwd.strip() and cwd.strip() != "/":
+                    dirs.add(cwd.strip())
+
+        # Docker volume mounts
+        mounts = self._run_remote(
+            "docker inspect $(docker ps -q) 2>/dev/null | "
+            "python3 -c \""
+            "import sys,json; "
+            "[print(m['Source']) for c in json.load(sys.stdin) "
+            " for m in c.get('Mounts',[]) "
+            " if m.get('Type')=='bind' and m.get('Source','').startswith('/')]"
+            "\" 2>/dev/null | sort -u | head -10"
+        )
+        if mounts:
+            for line in mounts.strip().splitlines():
+                d = line.strip()
+                if d and not d.startswith("/sys") and not d.startswith("/proc"):
+                    dirs.add(d)
+
+        return sorted(dirs)
+
     def _http_probe(self, port: int, path: str = "/", timeout: int = 4) -> Optional[str]:
         """Perform an HTTP GET and return status code + first 500 chars of body."""
         try:
@@ -383,19 +446,41 @@ class JavaScanner:
         """Detect Log4j versions vulnerable to CVE-2021-44228 (Log4Shell) and siblings."""
         result.raw_output += "\n--- Log4j / Log4Shell Check ---\n"
 
-        # Find log4j-core JARs on the filesystem
-        jar_find = self._run_remote(
-            "find /opt /srv /app /home /var/lib /usr/share "
-            "-name 'log4j-core-*.jar' -o -name 'log4j-*.jar' "
-            "2>/dev/null | grep -v '.bak' | head -20"
+        # Build search dirs dynamically: base dirs + wherever java processes actually live
+        java_procs_for_log4j = []
+        ps_out = self._run_remote(
+            "ps -eo pid,args 2>/dev/null | grep '[j]ava ' | head -20"
         )
-        # Also search open file descriptors of running processes
+        if ps_out:
+            for line in ps_out.strip().splitlines():
+                parts = line.split(None, 1)
+                if len(parts) == 2:
+                    java_procs_for_log4j.append({"pid": parts[0], "cmdline": parts[1]})
+
+        dynamic_dirs = self._discover_java_app_dirs(java_procs_for_log4j)
+        search_dirs = " ".join(dynamic_dirs[:15])
+
+        # 1) Filesystem search across all discovered app directories
+        jar_find = self._run_remote(
+            f"find {search_dirs} "
+            r"\( -name 'log4j-core-*.jar' -o -name 'log4j-*.jar' \) "
+            "2>/dev/null | grep -v '.bak' | head -25"
+        )
+
+        # 2) Directly extract log4j JARs from running process open file descriptors
         fd_find = self._run_remote(
-            "find /proc/*/fd -xtype f -name 'log4j*.jar' 2>/dev/null | head -10"
+            "find /proc/*/fd -xtype f -name 'log4j*.jar' 2>/dev/null | head -15"
+        )
+
+        # 3) Check inside fat JARs / classpath entries listed in process cmdlines
+        classpath_jars = self._run_remote(
+            "ps -eo args 2>/dev/null | grep '[j]ava ' | "
+            r"grep -oE '(\-cp|\-classpath) [^ ]+' | awk '{print $2}' | "
+            r"tr ':' '\n' | grep -iE 'log4j.*\.jar' | sort -u | head -10"
         )
 
         all_jars = set()
-        for output in [jar_find, fd_find]:
+        for output in [jar_find, fd_find, classpath_jars]:
             if output and output.strip():
                 for jar in output.strip().splitlines():
                     jar = jar.strip()
@@ -518,7 +603,10 @@ class JavaScanner:
         """
         result.raw_output += "\n--- Spring Boot Actuator Probe ---\n"
 
-        ports_to_check = [8080, 8081, 8090, 8443, 9090, 3000, 5000, 4000, 8888]
+        # Discover all listening ports dynamically; fallback to common defaults
+        _dynamic = self._discover_listening_ports()
+        _defaults = {8080, 8081, 8090, 8443, 9090, 3000, 5000, 4000, 8888, 8000, 9000}
+        ports_to_check = sorted(_defaults | set(_dynamic))
         sensitive_paths = {
             "/actuator/env":       ("Environment Variables & Config Exposed",    Severity.CRITICAL, "CWE-215", 9.1),
             "/actuator/heapdump":  ("Heap Dump Download (All In-Memory Secrets)", Severity.CRITICAL, "CWE-312", 9.1),
@@ -587,7 +675,10 @@ class JavaScanner:
         """Jolokia is a JMX-HTTP bridge — if exposed without auth, gives full JMX access."""
         result.raw_output += "\n--- Jolokia JMX-HTTP Bridge Check ---\n"
 
-        ports_to_check = [8080, 8081, 8090, 8443, 9090, 8161, 8778]
+        # Discover all listening ports + Jolokia-specific defaults
+        _dynamic = self._discover_listening_ports()
+        _defaults = {8080, 8081, 8090, 8443, 9090, 8161, 8778, 8888, 9000}
+        ports_to_check = sorted(_defaults | set(_dynamic))
 
         for port in ports_to_check:
             import socket
@@ -756,9 +847,22 @@ class JavaScanner:
         """Check if Spring Security auto-generated password appears in application logs."""
         result.raw_output += "\n--- Spring Security Default Password Check ---\n"
 
+        # Build log search dirs: system + wherever java processes actually log to
+        _java_procs_tmp: list[dict] = []
+        _ps = self._run_remote("ps -eo pid,args 2>/dev/null | grep '[j]ava ' | head -15")
+        if _ps:
+            for _line in _ps.strip().splitlines():
+                _parts = _line.split(None, 1)
+                if len(_parts) == 2:
+                    _java_procs_tmp.append({"pid": _parts[0], "cmdline": _parts[1]})
+        _app_dirs = self._discover_java_app_dirs(_java_procs_tmp)
+        _log_dirs = ["/var/log"] + [f"{d}/logs" for d in _app_dirs[:8]] + \
+                    [f"{d}/log" for d in _app_dirs[:8]]
+        _log_search_path = " ".join(_log_dirs[:16])
+
         log_search = self._run_remote(
-            "grep -rl 'Using generated security password' "
-            "/var/log /opt /srv /app /home 2>/dev/null | head -5"
+            f"grep -rl 'Using generated security password' "
+            f"{_log_search_path} 2>/dev/null | head -5"
         )
         if log_search and log_search.strip():
             # Extract the actual password if visible
