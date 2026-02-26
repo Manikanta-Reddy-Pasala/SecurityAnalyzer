@@ -96,7 +96,7 @@ python -m security_analyzer.binary_fuzzer --host <IP> --port 8080 --quiet
 
 ```bash
 # Step 1: Full infrastructure audit
-python -m security_analyzer --host <IP> --user ec2-user --key /path/to/key.pem
+python -m security_analyzer --host <IP> --user <user> --key /path/to/key.pem
 
 # Step 2: Fuzz service ports
 python -m security_analyzer.binary_fuzzer --host <IP> --port <PORT>
