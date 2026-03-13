@@ -69,7 +69,7 @@ class HTTPSScanner:
                 https_ports.append(port)
             else:
                 # Check if it at least responds to HTTP
-                status, _ = self._http_get(port, "/", tls=False)
+                status, _, _ = self._http_get(port, "/", tls=False)
                 if status > 0:
                     http_ports.append(port)
         return http_ports, https_ports
