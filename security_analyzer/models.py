@@ -29,6 +29,8 @@ class Category(Enum):
     DATABASE = "Database Security"
     JAVA_JVM = "Java/JVM Security"
     CONTAINER = "Container Security"
+    WEB_ATTACK = "Web Application Attack Surface"
+    TCP_ATTACK = "TCP Protocol Attack Surface"
 
 
 @dataclass
